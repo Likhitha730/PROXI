@@ -78,3 +78,10 @@ Acceptance criteria: all v1 acceptance criteria in PROJECT_REQUIREMENTS.md §6 p
 ## Exact Next Implementation Step
 
 Phase 0, task 1–2: create the folder structure (`client/`, `server/`) and the root `package.json`, then `client/package.json` (Vite + React + Socket.IO client) and `server/package.json` (Express + Socket.IO + mongodb), plus `client/vite.config.js` with `server: { port: 5173, strictPort: true }` and `.env.example`. Then verify both dev servers start. No application logic in that step.
+
+## Session Log
+
+- **Session 1 (2026-10-12) — Documentation baseline: complete and verified.** Requirements, architecture,
+  development plan and `.gitignore` are in place and cover every required topic; no application code
+  written and no dependencies installed. Findings and open decisions are recorded in
+  [SESSION_01_REPORT.md](./SESSION_01_REPORT.md). Next: Phase 0, tasks 1–2.
