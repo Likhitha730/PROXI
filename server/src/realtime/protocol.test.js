@@ -8,10 +8,10 @@ import {
   ALL_EVENTS,
   CLIENT_TO_SERVER_EVENTS,
   ERROR_CODES,
-  EVENTS,
   LIMITS,
   PROTOCOL_VERSION,
   SERVER_TO_CLIENT_EVENTS,
+  SIGNALING_EVENTS,
   createMoveUpdate,
   createPlayerRecord,
   createSnapshot,
@@ -25,15 +25,22 @@ import { SPAWNS, WALKABLE_BOUNDS, WORLD } from '../../../client/src/world/worldD
 
 describe('protocol shape', () => {
   it('exposes exactly the documented event set', () => {
-    expect(ALL_EVENTS).toHaveLength(8)
+    expect(ALL_EVENTS).toHaveLength(15)
     expect(ALL_EVENTS).toEqual([
       'player:join',
       'player:move',
+      'audio:ready',
+      'signal:offer',
+      'signal:answer',
+      'signal:ice',
+      'signal:close',
       'players:snapshot',
       'player:joined',
       'player:moved',
       'player:left',
       'proximity:update',
+      'audio:peer',
+      'audio:status',
       'server:error',
     ])
     expect(new Set(ALL_EVENTS).size).toBe(ALL_EVENTS.length)
@@ -41,10 +48,18 @@ describe('protocol shape', () => {
 
   it('namespaces every event by the entity it concerns', () => {
     for (const name of ALL_EVENTS) {
-      expect(name).toMatch(/^(player|players|proximity|server):[a-z]+$/)
+      expect(name).toMatch(/^(player|players|proximity|audio|signal|server):[a-z]+$/)
     }
-    expect(CLIENT_TO_SERVER_EVENTS).toEqual([EVENTS.JOIN, EVENTS.MOVE])
-    expect(SERVER_TO_CLIENT_EVENTS).toHaveLength(6)
+    expect(CLIENT_TO_SERVER_EVENTS).toHaveLength(7)
+    expect(SERVER_TO_CLIENT_EVENTS).toHaveLength(12)
+    // The four signalling events are the only ones that travel both ways, and they
+    // appear exactly once in the combined list.
+    expect(SIGNALING_EVENTS).toHaveLength(4)
+    for (const event of SIGNALING_EVENTS) {
+      expect(CLIENT_TO_SERVER_EVENTS).toContain(event)
+      expect(SERVER_TO_CLIENT_EVENTS).toContain(event)
+      expect(ALL_EVENTS.filter((name) => name === event)).toHaveLength(1)
+    }
   })
 
   it('agrees with the map data the renderer uses', () => {
@@ -61,7 +76,22 @@ describe('protocol shape', () => {
 
   it('builds one consistent player record for snapshots and moves', () => {
     const record = createPlayerRecord({ id: 'p1', name: 'Ada', x: 10.123456, y: 20, dir: 1, moving: true })
-    expect(record).toEqual({ id: 'p1', name: 'Ada', x: 10.12, y: 20, dir: 1, moving: true, joinedAt: expect.any(Number) })
+    expect(record).toEqual({
+      id: 'p1',
+      name: 'Ada',
+      x: 10.12,
+      y: 20,
+      dir: 1,
+      moving: true,
+      joinedAt: expect.any(Number),
+      // Audio eligibility travels with the record, so a joiner knows who is already
+      // willing to talk without a second round trip.
+      audio: { enabled: false, muted: false },
+    })
+    expect(createPlayerRecord({ id: 'p2', name: 'G', x: 0, y: 0, audio: { enabled: true, muted: true } }).audio).toEqual({
+      enabled: true,
+      muted: true,
+    })
     expect(roundCoord(2.999)).toBe(3)
     expect(roundCoord(10.123456)).toBe(10.12)
 

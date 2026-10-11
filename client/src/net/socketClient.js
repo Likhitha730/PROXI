@@ -14,6 +14,7 @@ import { io } from 'socket.io-client'
 import { EVENTS, LIMITS } from '../../../shared/protocol.js'
 import { env } from '../config/env.js'
 import { connectionStore } from '../state/connectionStore.js'
+import { audioEngine } from '../audio/audioEngine.js'
 import { presence } from './presence.js'
 
 const SOCKET_OPTIONS = Object.freeze({
@@ -104,6 +105,8 @@ function bindLifecycle(activeSocket) {
 
   activeSocket.on('disconnect', (reason) => {
     presence.reset()
+    // Every call is over: the server forgets the pairs, and so do we.
+    audioEngine.dropAllSessions()
     connectionStore.set({
       status: reason === 'io client disconnect' ? 'disconnected' : 'error',
       socketId: null,
@@ -150,12 +153,42 @@ function bindLifecycle(activeSocket) {
  * a StrictMode remount can never double-register listeners.
  */
 function bindProtocol(activeSocket) {
-  activeSocket.on(EVENTS.SNAPSHOT, (payload) => presence.applySnapshot(payload))
+  activeSocket.on(EVENTS.SNAPSHOT, (payload) => {
+    presence.applySnapshot(payload)
+    // Negotiation roles are derived from player ids, so the engine needs ours.
+    audioEngine.setSelfId(payload?.self?.id ?? null)
+  })
   activeSocket.on(EVENTS.JOINED, (payload) => presence.applyJoined(payload))
   activeSocket.on(EVENTS.MOVED, (update) => presence.applyMove(update))
-  activeSocket.on(EVENTS.LEFT, (payload) => presence.applyLeft(payload))
+  activeSocket.on(EVENTS.LEFT, (payload) => {
+    presence.applyLeft(payload)
+    // A player who left cannot be talking: drop their session and their audio.
+    audioEngine.revoke(payload?.id, { reason: 'peer_left' })
+  })
   activeSocket.on(EVENTS.PROXIMITY, (payload) => presence.applyProximity(payload))
   activeSocket.on(EVENTS.ERROR, (payload) => presence.applyError(payload))
+
+  // ------------------------------------------------------------- audio -----
+  // The socket is the transport for the audio engine; the engine itself never
+  // touches Socket.IO, so its negotiation logic stays unit-testable.
+  audioEngine.setTransport({
+    announce: (state) => activeSocket.emit(EVENTS.AUDIO_READY, state),
+    offer: (targetId, sdp) => activeSocket.emit(EVENTS.SIGNAL_OFFER, { targetId, sdp }),
+    answer: (targetId, sdp) => activeSocket.emit(EVENTS.SIGNAL_ANSWER, { targetId, sdp }),
+    ice: (targetId, candidate) => activeSocket.emit(EVENTS.SIGNAL_ICE, { targetId, candidate }),
+    close: (targetId, reason) => activeSocket.emit(EVENTS.SIGNAL_CLOSE, { targetId, reason }),
+  })
+
+  activeSocket.on(EVENTS.AUDIO_PEER, (payload) => audioEngine.applyPeer(payload))
+  activeSocket.on(EVENTS.AUDIO_STATUS, (payload) => audioEngine.applyStatus(payload))
+  activeSocket.on(EVENTS.SIGNAL_OFFER, (payload) =>
+    audioEngine.handleSignal(payload.fromId, { type: 'offer', sdp: payload.sdp.sdp }, { fromName: payload.fromName }),
+  )
+  activeSocket.on(EVENTS.SIGNAL_ANSWER, (payload) =>
+    audioEngine.handleSignal(payload.fromId, { type: 'answer', sdp: payload.sdp.sdp }, { fromName: payload.fromName }),
+  )
+  activeSocket.on(EVENTS.SIGNAL_ICE, (payload) => audioEngine.handleIce(payload.fromId, payload.candidate))
+  activeSocket.on(EVENTS.SIGNAL_CLOSE, (payload) => audioEngine.revoke(payload.fromId, { reason: payload.reason }))
 }
 
 /** Create the socket on first use and return it thereafter. */

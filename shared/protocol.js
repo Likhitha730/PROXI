@@ -26,6 +26,7 @@ export const EVENTS = Object.freeze({
   // client -> server
   JOIN: 'player:join',
   MOVE: 'player:move',
+  AUDIO_READY: 'audio:ready',
 
   // server -> client
   SNAPSHOT: 'players:snapshot',
@@ -33,20 +34,47 @@ export const EVENTS = Object.freeze({
   MOVED: 'player:moved',
   LEFT: 'player:left',
   PROXIMITY: 'proximity:update',
+  AUDIO_PEER: 'audio:peer',
+  AUDIO_STATUS: 'audio:status',
   ERROR: 'server:error',
+
+  // WebRTC signalling — the same name in both directions, with a different
+  // payload: a client sends `targetId`, the server relays it with `fromId` set
+  // from the socket's own identity. A client can never claim to be someone else.
+  SIGNAL_OFFER: 'signal:offer',
+  SIGNAL_ANSWER: 'signal:answer',
+  SIGNAL_ICE: 'signal:ice',
+  SIGNAL_CLOSE: 'signal:close',
 })
 
+/** Signalling events travel in both directions. */
+export const SIGNALING_EVENTS = Object.freeze([
+  EVENTS.SIGNAL_OFFER,
+  EVENTS.SIGNAL_ANSWER,
+  EVENTS.SIGNAL_ICE,
+  EVENTS.SIGNAL_CLOSE,
+])
+
 /** Event names grouped by direction (used by tests and documentation). */
-export const CLIENT_TO_SERVER_EVENTS = Object.freeze([EVENTS.JOIN, EVENTS.MOVE])
+export const CLIENT_TO_SERVER_EVENTS = Object.freeze([
+  EVENTS.JOIN,
+  EVENTS.MOVE,
+  EVENTS.AUDIO_READY,
+  ...SIGNALING_EVENTS,
+])
 export const SERVER_TO_CLIENT_EVENTS = Object.freeze([
   EVENTS.SNAPSHOT,
   EVENTS.JOINED,
   EVENTS.MOVED,
   EVENTS.LEFT,
   EVENTS.PROXIMITY,
+  EVENTS.AUDIO_PEER,
+  EVENTS.AUDIO_STATUS,
+  ...SIGNALING_EVENTS,
   EVENTS.ERROR,
 ])
-export const ALL_EVENTS = Object.freeze([...CLIENT_TO_SERVER_EVENTS, ...SERVER_TO_CLIENT_EVENTS])
+/** Every distinct event name (the four signalling names appear once). */
+export const ALL_EVENTS = Object.freeze([...new Set([...CLIENT_TO_SERVER_EVENTS, ...SERVER_TO_CLIENT_EVENTS])])
 
 /**
  * Numeric limits shared by both sides.
@@ -104,6 +132,35 @@ export const LIMITS = Object.freeze({
 
   /** Cap on simultaneous players per room. */
   MAX_PLAYERS_PER_ROOM: 24,
+
+  /*
+   * Audio / WebRTC signalling.
+   *
+   * The listening radius above decides *who may connect*; these limits bound the
+   * signalling traffic and the payloads a client may push through the relay.
+   */
+  /** Signalling budget per socket: SDP and ICE are bursty, so the bucket is wide. */
+  AUDIO_SIGNALING_PER_SECOND: 40,
+  AUDIO_SIGNALING_BURST: 80,
+  /** A full SDP with a handful of codecs is 4-6 KB; anything larger is refused. */
+  SDP_MAX_LENGTH: 12_000,
+  /** One ICE candidate line, including its `a=candidate:` prefix. */
+  ICE_CANDIDATE_MAX_LENGTH: 1_000,
+  /** Never hold more simultaneous audio peers than proximity can produce. */
+  AUDIO_MAX_PEERS: 16,
+  /**
+   * An established audio pair is only torn down beyond radius + this, so a player
+   * pacing on the boundary does not repeatedly lose their call.
+   */
+  AUDIO_RELEASE_HYSTERESIS: 12,
+
+  /*
+   * Client-side voice activity detection (RMS of the analyser buffer), used only
+   * for the "speaking" indicator — never for routing or gain.
+   */
+  SPEAKING_RMS_THRESHOLD: 0.045,
+  /** Keep the indicator lit across the natural pauses between words. */
+  SPEAKING_HANG_MS: 260,
 })
 
 /**
@@ -176,6 +233,9 @@ export const ERROR_CODES = Object.freeze({
   INVALID_NAME: 'invalid_name',
   INVALID_PAYLOAD: 'invalid_payload',
   INVALID_POSITION: 'invalid_position',
+  INVALID_SIGNAL: 'invalid_signal',
+  AUDIO_NOT_READY: 'audio_not_ready',
+  AUDIO_TARGET_UNAVAILABLE: 'audio_target_unavailable',
   RATE_LIMITED: 'rate_limited',
   ROOM_FULL: 'room_full',
   JOIN_REQUIRED: 'join_required',
@@ -287,8 +347,29 @@ export function validateMove(payload, previous = null, options = {}) {
 }
 
 /** The canonical full player record. */
-export function createPlayerRecord({ id, name, x, y, dir = Math.PI / 2, moving = false, joinedAt = Date.now() }) {
-  return Object.freeze({ id, name, x: roundCoord(x), y: roundCoord(y), dir, moving: Boolean(moving), joinedAt })
+export function createPlayerRecord({
+  id,
+  name,
+  x,
+  y,
+  dir = Math.PI / 2,
+  moving = false,
+  joinedAt = Date.now(),
+  // Audio eligibility travels with the player record, so a joiner immediately knows
+  // who is already willing to talk (see AUDIO_DEFAULTS). It is a declaration the
+  // server relays — never a claim a client makes about somebody else.
+  audio = AUDIO_DEFAULTS,
+}) {
+  return Object.freeze({
+    id,
+    name,
+    x: roundCoord(x),
+    y: roundCoord(y),
+    dir,
+    moving: Boolean(moving),
+    joinedAt,
+    audio: createAudioState(audio),
+  })
 }
 
 /** `players:snapshot` — sent to a client immediately after it joins. */
@@ -333,4 +414,216 @@ export function pickSpawnPoint(existing = []) {
     }
   }
   return best
+}
+
+// ---------------------------------------------------------------------------
+// Audio and WebRTC signalling
+// ---------------------------------------------------------------------------
+
+/**
+ * Player ids are server-minted UUIDs. A target id therefore only ever has to be a
+ * short, safe token — which lets us reject arbitrary junk before any lookup.
+ */
+const ID_PATTERN = /^[A-Za-z0-9_-]{1,64}$/
+
+const isSafeString = (value, maxLength) =>
+  typeof value === 'string' && value.length > 0 && value.length <= maxLength && !value.includes('\0')
+
+/**
+ * The audio state of one player, as the server tracks it.
+ *
+ * `enabled` means "I hold a live microphone and am willing to connect"; `muted`
+ * means "connected, but my track is off". Both are declarations the server
+ * relays to authorized peers — never a claim about another player.
+ */
+export const AUDIO_DEFAULTS = Object.freeze({ enabled: false, muted: false })
+
+/** The audio block carried on a player record. */
+export function createAudioState({ enabled = false, muted = false } = {}) {
+  return { enabled: Boolean(enabled), muted: Boolean(muted) }
+}
+
+/**
+ * Canonical key for an unordered pair of player ids, so both sides of a call
+ * agree on one identity for it regardless of who initiated.
+ */
+export function pairKey(a, b) {
+  return String(a) <= String(b) ? `${a}|${b}` : `${b}|${a}`
+}
+
+/**
+ * Validate `audio:ready` — a client telling the server whether it currently has a
+ * microphone and wants audio.
+ *
+ * @returns {{ ok: true, value: { enabled: boolean, muted: boolean } } | { ok: false, code: string, reason: string }}
+ */
+export function validateAudioReady(payload) {
+  if (!payload || typeof payload !== 'object') {
+    return { ok: false, code: ERROR_CODES.INVALID_PAYLOAD, reason: 'payload must be an object' }
+  }
+  if (typeof payload.enabled !== 'boolean') {
+    return { ok: false, code: ERROR_CODES.INVALID_PAYLOAD, reason: 'enabled must be a boolean' }
+  }
+  if (payload.muted !== undefined && typeof payload.muted !== 'boolean') {
+    return { ok: false, code: ERROR_CODES.INVALID_PAYLOAD, reason: 'muted must be a boolean' }
+  }
+  return { ok: true, value: createAudioState({ enabled: payload.enabled, muted: payload.muted ?? false }) }
+}
+
+/** Validate the shared `targetId` field of an outbound signalling payload. */
+function validateTarget(payload) {
+  if (!payload || typeof payload !== 'object') {
+    return { ok: false, code: ERROR_CODES.INVALID_PAYLOAD, reason: 'payload must be an object' }
+  }
+  if (!isSafeString(payload.targetId, 64) || !ID_PATTERN.test(payload.targetId)) {
+    return { ok: false, code: ERROR_CODES.INVALID_PAYLOAD, reason: 'targetId must be a player id' }
+  }
+  return { ok: true, value: payload.targetId }
+}
+
+/**
+ * Validate a session description for the expected type.
+ *
+ * The server never parses SDP semantics — it relays it — but it does refuse
+ * anything that is not a bounded string of the right type, which removes the
+ * obvious ways to use the relay as a generic data pipe.
+ */
+function validateSessionDescription(payload, expectedType) {
+  const target = validateTarget(payload)
+  if (!target.ok) return target
+
+  const sdp = payload.sdp
+  if (!sdp || typeof sdp !== 'object') {
+    return { ok: false, code: ERROR_CODES.INVALID_SIGNAL, reason: 'sdp must be an object' }
+  }
+  if (sdp.type !== expectedType) {
+    return { ok: false, code: ERROR_CODES.INVALID_SIGNAL, reason: `sdp.type must be "${expectedType}"` }
+  }
+  if (!isSafeString(sdp.sdp, LIMITS.SDP_MAX_LENGTH)) {
+    return {
+      ok: false,
+      code: ERROR_CODES.INVALID_SIGNAL,
+      reason: `sdp.sdp must be a string of at most ${LIMITS.SDP_MAX_LENGTH} characters`,
+    }
+  }
+  if (!sdp.sdp.startsWith('v=')) {
+    return { ok: false, code: ERROR_CODES.INVALID_SIGNAL, reason: 'sdp.sdp is not a session description' }
+  }
+
+  return { ok: true, value: { targetId: target.value, sdp: { type: expectedType, sdp: sdp.sdp } } }
+}
+
+/** `signal:offer { targetId, sdp: { type: 'offer', sdp } }` */
+export function validateOffer(payload) {
+  return validateSessionDescription(payload, 'offer')
+}
+
+/** `signal:answer { targetId, sdp: { type: 'answer', sdp } }` */
+export function validateAnswer(payload) {
+  return validateSessionDescription(payload, 'answer')
+}
+
+/**
+ * `signal:ice { targetId, candidate }`
+ *
+ * A `null` candidate is the documented end-of-candidates marker and is relayed
+ * as-is; otherwise the shape is bounded and coerced to the fields a browser needs.
+ */
+export function validateIce(payload) {
+  const target = validateTarget(payload)
+  if (!target.ok) return target
+
+  const { candidate } = payload
+  if (candidate === null) return { ok: true, value: { targetId: target.value, candidate: null } }
+  if (!candidate || typeof candidate !== 'object') {
+    return { ok: false, code: ERROR_CODES.INVALID_SIGNAL, reason: 'candidate must be an object or null' }
+  }
+  if (!isSafeString(candidate.candidate, LIMITS.ICE_CANDIDATE_MAX_LENGTH)) {
+    return {
+      ok: false,
+      code: ERROR_CODES.INVALID_SIGNAL,
+      reason: `candidate.candidate must be a string of at most ${LIMITS.ICE_CANDIDATE_MAX_LENGTH} characters`,
+    }
+  }
+  if (!candidate.candidate.startsWith('candidate:')) {
+    return { ok: false, code: ERROR_CODES.INVALID_SIGNAL, reason: 'candidate.candidate must start with "candidate:"' }
+  }
+  const mLineIndex = candidate.sdpMLineIndex
+  if (mLineIndex !== undefined && mLineIndex !== null && (!Number.isInteger(mLineIndex) || mLineIndex < 0 || mLineIndex > 32)) {
+    return { ok: false, code: ERROR_CODES.INVALID_SIGNAL, reason: 'candidate.sdpMLineIndex must be a small integer' }
+  }
+  if (candidate.sdpMid !== undefined && candidate.sdpMid !== null && !isSafeString(candidate.sdpMid, 32)) {
+    return { ok: false, code: ERROR_CODES.INVALID_SIGNAL, reason: 'candidate.sdpMid must be a short string' }
+  }
+  if (candidate.usernameFragment !== undefined && candidate.usernameFragment !== null && !isSafeString(candidate.usernameFragment, 256)) {
+    return { ok: false, code: ERROR_CODES.INVALID_SIGNAL, reason: 'candidate.usernameFragment must be a short string' }
+  }
+
+  return {
+    ok: true,
+    value: {
+      targetId: target.value,
+      candidate: {
+        candidate: candidate.candidate,
+        sdpMid: candidate.sdpMid ?? null,
+        sdpMLineIndex: mLineIndex ?? null,
+        usernameFragment: candidate.usernameFragment ?? null,
+      },
+    },
+  }
+}
+
+/** Reasons a client may give for closing an audio session (bounded vocabulary). */
+export const AUDIO_CLOSE_REASONS = Object.freeze(['hangup', 'mute', 'error', 'renegotiate'])
+
+/** `signal:close { targetId, reason? }` */
+export function validateSignalClose(payload) {
+  const target = validateTarget(payload)
+  if (!target.ok) return target
+  const reason = payload.reason === undefined ? 'hangup' : payload.reason
+  if (!AUDIO_CLOSE_REASONS.includes(reason)) {
+    return { ok: false, code: ERROR_CODES.INVALID_SIGNAL, reason: `reason must be one of ${AUDIO_CLOSE_REASONS.join(', ')}` }
+  }
+  return { ok: true, value: { targetId: target.value, reason } }
+}
+
+/** Status values the server reports about one audio pair (see docs/ARCHITECTURE.md §8). */
+export const AUDIO_STATUS = Object.freeze({
+  /** Both sides are eligible and in range: you may connect. */
+  READY: 'ready',
+  /** The peer withdrew their microphone, or never offered one. */
+  PEER_INELIGIBLE: 'peer_ineligible',
+  /** You withdrew your own microphone, so your pairs were closed. */
+  SELF_INELIGIBLE: 'self_ineligible',
+  /** One of you left the listening radius. */
+  OUT_OF_RANGE: 'out_of_range',
+  /** The peer's session ended. */
+  PEER_LEFT: 'peer_left',
+  /** The server refused this pair (see `server:error` for the reason). */
+  DENIED: 'denied',
+})
+
+/**
+ * `audio:peer` — one peer's audio eligibility, as seen by an in-range listener.
+ *
+ * `allowed` is the verdict for the *pair*: true only when both sides hold a live
+ * microphone and are within the listening radius, which is exactly when a client
+ * may open a peer connection. A peer with a microphone you cannot yet connect to
+ * (because your own is off, or they are out of earshot) is reported with
+ * `allowed: false` — visible, but not connectable.
+ */
+export function createAudioPeer({ id, name, audio, allowed = true }) {
+  return {
+    peerId: id,
+    name: name ?? null,
+    enabled: Boolean(audio?.enabled),
+    muted: Boolean(audio?.muted),
+    allowed: Boolean(allowed),
+  }
+}
+
+/** `audio:status` — the server's lifecycle view of one audio pair. */
+export function createAudioStatus({ peerId, status, allowed, detail = undefined }) {
+  const payload = { peerId, status, allowed: Boolean(allowed) }
+  return detail === undefined ? payload : { ...payload, detail }
 }

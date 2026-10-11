@@ -30,9 +30,10 @@ ProxiSpeak/
 │   │   ├── config/env.js       # typed access to import.meta.env
 │   │   ├── world/              # PURE: world map data, collision, math (no DOM, no net)
 │   │   ├── render/             # Canvas renderer, camera, avatar animation (no net)
-│   │   ├── net/                # Socket.IO client wrapper, WebRTC manager, audio graph
+│   │   ├── net/                # Socket.IO client wrapper + WebRTC transport wiring
+│   │   ├── audio/              # audio engine, ICE resolution, voice-activity detection
 │   │   ├── state/              # client-side world state store (local + remote merged)
-│   │   ├── components/         # React HUD: nearby panel, connection badge, settings
+│   │   ├── components/         # React HUD: nearby panel, Voice panel, session panels
 │   │   └── styles/
 │   ├── index.html
 │   └── vite.config.js          # server: { port: 5173, strictPort: true }
@@ -41,10 +42,13 @@ ProxiSpeak/
 │   │   ├── index.js            # Express + Socket.IO bootstrap
 │   │   ├── config/env.js       # env access with defaults and validation
 │   │   ├── db/mongo.js         # official driver connect + index setup
-│   │   ├── sockets/handlers.js     # presence protocol (join/move/disconnect)
+│   │   ├── sockets/handlers.js     # presence + audio signalling protocol
 │   │   ├── realtime/registry.js    # authoritative player table
-│   │   ├── realtime/rateLimiter.js # token bucket for movement updates
-│   │   └── db/mongo.js             # persistence (not enabled yet)
+│   │   ├── realtime/proximity.js   # who is within earshot
+│   │   ├── realtime/audio.js       # pair authorization + signal relay
+│   │   ├── realtime/rateLimiter.js # token bucket for movement/signalling
+│   │   ├── routes/ice.js           # GET /api/ice (STUN/TURN config)
+│   │   └── db/                     # MongoDB persistence (positions archive)
 │   └── package.json
 ├── shared/
 │   └── protocol.js             # ONE wire contract imported by client AND server
@@ -52,9 +56,10 @@ ProxiSpeak/
 └── .gitignore
 ```
 
-Rule: `world/`, `render/`, `realtime/`, and `shared/` are pure and unit-testable;
-`net/` (client) and `sockets/` (server) are the only I/O boundaries. Proximity and
-signalling services land in `server/src/realtime/` in a later session.
+Rule: `world/`, `render/`, `realtime/` and `shared/` are pure and unit-testable;
+`net/` and `sockets/` are the only I/O boundaries, and `client/src/audio/` stays free
+of both React and Socket.IO (it is handed a transport) so its negotiation logic can be
+tested — and driven by `scripts/verify-audio.mjs` — without a browser.
 
 ## 3. World Model and Coordinate System
 
@@ -104,14 +109,19 @@ signalling services land in `server/src/realtime/` in a later session.
 The wire contract lives in **`shared/protocol.js`**, imported by both `client/` and
 `server/`, so an event name or payload shape cannot drift between the two sides.
 Event names are namespaced by the entity they concern: `player:*`, `players:*`,
-`server:*`. Unknown events are ignored (never an error) on both sides, and every
+`proximity:*`, `audio:*` and `signal:*` (WebRTC), plus `server:*`. Unknown events are ignored (never an error) on both sides, and every
 inbound payload is validated with hand-rolled validators (no validation library).
 
 A "player" is always the full record:
 
 ```js
-{ id, name, x, y, dir, moving, joinedAt }   // id is server-minted; dir in radians
+{ id, name, x, y, dir, moving, joinedAt, audio: { enabled, muted } }
+// id is server-minted; dir in radians; `audio` is the session's microphone state
 ```
+
+Fifteen events make the full contract (seven client → server, twelve server →
+client, counting the four relayed `signal:*` events once each). The WebRTC half is
+specified in §8.2; the list below is the movement/presence half.
 
 Client → Server:
 
@@ -129,10 +139,14 @@ Server → Client:
 | `player:moved` | `{ id, x, y, dir, moving, serverTs }` | the 15 Hz delta — only the fields that change |
 | `player:left` | `{ id }` | on disconnect (transient state is dropped server-side) |
 | `proximity:update` | `{ id, radius, neighbours[], at }` | the documented proximity result: nearest first, self excluded, deduplicated; each neighbour is `{ id, name, x, y, distance, nearby: true }`. Sent on join, when the neighbour set changes, and (at ≤ 4 Hz) when distances have moved enough to be worth redrawing |
+| `audio:peer` | `{ peerId, name, enabled, muted, allowed }` | the server's view of one session's microphone; `allowed` is the *pair* verdict (§8.2) |
+| `audio:status` | `{ peerId, status, allowed, detail? }` | pair lifecycle: `ready` / `peer_ineligible` / `self_ineligible` / `out_of_range` / `peer_left` / `denied` |
+| `signal:*` | see §8.2 | relayed offers, answers, ICE candidates and hang-ups, with the sender added by the server |
 | `server:error` | `{ code, message, data? }` | recoverable; `data` carries corrections (`{ x, y }` for `invalid_position`) |
 
 Error codes: `invalid_name`, `invalid_payload`, `invalid_position`, `rate_limited`,
-`room_full`, `join_required`, `internal_error`.
+`room_full`, `join_required`, `internal_error`, plus the audio signalling codes
+`invalid_signal`, `audio_not_ready` and `audio_target_unavailable`.
 
 Authority rules: the registry is the single source of truth for positions; a
 rejected update is answered with a correction and never broadcast; movement is
@@ -196,17 +210,106 @@ people have been; it is deliberately *not* on the real-time path.
   in-process double `server/src/test/fakeMongo.js`, and the numbers published for it
   are that double's numbers.
 
-## 8. WebRTC Signaling Flow
+## 8. WebRTC Signaling Flow (implemented)
 
-1. Client receives `proximity:update`; for each user entering AUDIO_RANGE (450 units) without an existing peer → create `RTCPeerConnection`, create offer, send `signal:offer { targetId, sdp }`.
-2. Target receives offer → `setRemoteDescription` → `createAnswer` → `signal:answer`.
-3. Both sides exchange `signal:ice` candidates (trickle).
-4. `ontrack` → attach the `MediaStream` to the Web Audio graph (not to an `<audio>` element).
-5. When distance > AUDIO_RANGE + hysteresis (50 units) or the user leaves → close the peer connection and disconnect audio nodes.
-6. ICE servers: STUN only in v1 (TURN is a documented risk for symmetric NATs).
-7. Mic: `getUserMedia({ audio: { echoCancellation: true, noiseSuppression: true } })` once per session; denial → UI state "audio disabled"; proximity and panels still work.
+Proximity decides *who may talk to whom*; the server decides *whether* they may, and
+the browsers do the rest over WebRTC. No audio ever passes through the backend.
 
-## 9. Spatial Audio Graph (Web Audio API)
+### 8.1 The rule
+
+A pair may call when **all** of the following hold, evaluated server-side from the
+server's own state (never from a client's claim):
+
+1. both sessions have declared a live microphone (`audio:ready { enabled: true }`),
+2. both are inside the listening radius (100 world units), or were already allowed
+   and are still within radius + 12 units (hysteresis, so a step across the boundary
+   does not flap the call),
+3. neither session has disconnected.
+
+Sender identity always comes from the socket that sent the message. A payload may
+contain `targetId`; anything resembling a sender id (`fromId`, `from`, `id`) is
+ignored. Packets that name a target outside the pair table are dropped, and the
+recipient is resolved from the server's own table rather than from the payload.
+
+### 8.2 The events
+
+| Direction | Event | Payload |
+| --- | --- | --- |
+| C → S | `audio:ready` | `{ enabled, muted? }` |
+| C → S | `signal:offer` / `signal:answer` | `{ targetId, sdp: { type, sdp } }` |
+| C → S | `signal:ice` | `{ targetId, candidate \| null }` (`null` = end-of-candidates) |
+| C → S | `signal:close` | `{ targetId, reason? }` |
+| S → C | `audio:peer` | `{ peerId, name, enabled, muted, allowed }` — the server's view of one peer; `allowed` is the *pair* verdict |
+| S → C | `audio:status` | `{ peerId, status, allowed, detail? }` — `ready`, `peer_ineligible`, `self_ineligible`, `out_of_range`, `peer_left`, `denied` |
+| S → C | `signal:offer` / `signal:answer` | `{ fromId, fromName, sdp }` — **no** `targetId`, sender added by the server |
+| S → C | `signal:ice` | `{ fromId, fromName, candidate }` |
+| S → C | `signal:close` | `{ fromId, fromName, reason }` |
+
+Limits enforced before a packet is relayed: SDP ≤ 12 000 characters, a candidate
+≤ 1 000 characters, and 40 signalling messages per second with a burst of 80.
+
+### 8.3 The flow
+
+1. The user presses **Enable microphone**. `getUserMedia({ audio: { echoCancellation,
+   noiseSuppression, autoGainControl } })` is called **only** from that gesture; the
+   engine never asks for a microphone on its own. The result — granted, denied, no
+   device, no `getUserMedia` at all — becomes a visible state in the Voice panel.
+2. The client sends `audio:ready { enabled: true }`. The server re-evaluates every
+   pair involving that session from **live registry positions** and answers with
+   `audio:status { status: 'ready', allowed: true }` to both sides.
+3. Each side builds one `RTCPeerConnection` for the peer and attaches the local tracks.
+   Roles are fixed by player-id ordering (perfect negotiation): the lexicographically
+   *smaller* id is impolite — it creates the offer and ignores a colliding offer — and
+   the larger id is polite, rolling back its own offer if one arrives. That removes
+   glare and duplicate peer connections without an extra round trip.
+4. Offers, answers and trickled ICE candidates are relayed by the server with the
+   sender rewritten. Candidates that arrive before a remote description are queued.
+5. `ontrack` attaches the remote stream to an `<audio>` element created and owned by
+   the engine (autoplay rejection is reported, not swallowed), and a voice-activity
+   detector on the same stream drives the speaking indicator.
+6. Walking out of earshot, muting the microphone, switching it off, pressing hang-up
+   or disconnecting makes the server send `audio:status { allowed: false }` to both
+   sides; each side closes the connection, stops its detector and releases the audio
+   element. Nothing is left behind.
+
+### 8.4 ICE configuration
+
+Resolved in this order, first hit wins:
+
+1. `GET /api/ice` → `{ iceServers, hasTurn, ttlSeconds }` (cache 5 minutes,
+   `Cache-Control: no-store`). **This is the production path**, because TURN
+   credentials are secrets: a value baked into the bundle is public.
+2. `VITE_ICE_STUN_URLS` / `VITE_ICE_TURN_URL` / `VITE_ICE_TURN_USERNAME` /
+   `VITE_ICE_TURN_CREDENTIAL` — a documented development override only.
+3. The built-in public STUN server, so a call on localhost or a LAN works out of the
+   box. The resolved `source` is kept in state so the UI can be honest: a failed
+   connection says whether a TURN relay was available.
+
+Server-side keys: `ICE_STUN_URLS`, `ICE_TURN_URL`, `ICE_TURN_USERNAME`,
+`ICE_TURN_CREDENTIAL` (see `server/.env.example`). **TURN credentials are never
+committed** — `.env` files are git-ignored and the example file ships empty values.
+
+Restrictive networks (symmetric NAT, corporate firewalls, UDP blocked) do require a
+TURN relay; that is documented rather than hidden, and the UI distinguishes “no relay
+configured” from “connection failed”.
+
+### 8.5 Privacy and logging
+
+Audio content is never recorded, buffered or forwarded — only RTP between the two
+browsers. Logs contain ids, states, sizes and error names: never SDP bodies, never
+candidate addresses, never device labels, never sample data. The voice-activity
+detector publishes a single boolean and connects its analyser to nothing.
+
+### 8.6 Deliberately out of scope this session
+
+Distance-based volume and stereo panning are **not** implemented: every call plays at
+full volume. Section 9 below describes that graph as it was planned; it is a design
+note for a later session, not a description of the current build.
+
+## 9. Spatial Audio Graph (Web Audio API) — planned, NOT implemented
+
+> Status: design note for a later session. The current build attaches remote streams
+> to plain `<audio>` elements at full volume; there is no gain or panning node. See §8.6.
 
 Per remote peer:
 
@@ -222,7 +325,20 @@ MediaStreamAudioSourceNode → GainNode (distance) → StereoPannerNode → dest
 ## 10. Security Risks
 
 - Unvalidated coordinates → anti-teleport + bounds checks (server).
-- Event flooding → per-socket rate limits on `position:update` and signaling events.
+- Event flooding → per-socket rate limits on every inbound event; signalling is
+  limited to 40 messages/second with a burst of 80.
+- **Signal spoofing** → a sender identity supplied by a client is ignored entirely;
+  the server resolves the sender from the socket and derives the recipient from its
+  own authorized-pair table. Out-of-pair, out-of-range, self-addressed and
+  not-ready signals are refused.
+- **Media interception** → audio is peer-to-peer over DTLS-SRTP; it never transits
+  the server, and no content (SDP is metadata, but audio is neither recorded nor
+  buffered) is logged.
+- **Credential leakage** → TURN credentials live in server environment variables and
+  are served per-request from `/api/ice`; the logger scrubs secrets, and `.env` files
+  are git-ignored.
+- **Permission abuse** → the microphone is requested only from an explicit user
+  action, never on load, and the active state is always visible in the UI.
 - Secrets → `MONGODB_URI`, `CORS_ORIGIN` via env; `.env` gitignored; `.env.example` documents keys without values. The logger redacts sensitive keys **and scrubs string values** (`scrubSecrets`), so a connection string cannot leak through a driver error message.
 - XSS via display names → React escapes by default; canvas `fillText` is safe; still sanitize length/charset.
 - WebRTC permission errors → graceful degradation.
@@ -230,9 +346,19 @@ MediaStreamAudioSourceNode → GainNode (distance) → StereoPannerNode → dest
 
 ## 11. Test Strategy
 
-- **Unit (Vitest):** world math, collision, interpolation, proximity math, validation, gain/pan formulas.
-- **Integration:** Socket.IO handlers with `socket.io-client` in-memory; join/move/leave/proximity flows; disconnect cleanup.
-- **Manual E2E checklist** (two tabs + two machines): movement, collision, interpolation, proximity panel, audio connect/disconnect, pan/attenuation, reconnect, mic denial.
+- **Unit (Vitest):** world math, collision, interpolation, proximity math, validation,
+  the audio authorization rules, the ICE resolution order, and the client audio engine
+  against a fake `RTCPeerConnection`/`mediaDevices` (negotiation roles, teardown, mic
+  consent, speaking flags).
+- **Integration:** Socket.IO handlers with `socket.io-client` in-memory; join/move/
+  leave/proximity/audio flows; disconnect cleanup; malformed and hostile payloads.
+- **Scripted end-to-end:** `scripts/verify-multiplayer.mjs` (two clients: presence,
+  movement, proximity) and `scripts/verify-audio.mjs` (two clients driving the **real**
+  audio engine over **real SRTP** with `@roamhq/wrtc`, against a running server).
+- **Manual E2E checklist** (two browsers on `localhost` or HTTPS): movement, collision,
+  interpolation, proximity panel, microphone consent and denial, talking, muting,
+  walking out of earshot, reconnect. See `docs/SESSION_06_REPORT.md` for exactly which
+  parts of that list the sandbox could not execute.
 - No feature is claimed "working" until its acceptance criteria are executed and observed.
 
 ## 12. Deployment Plan (later session)

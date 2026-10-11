@@ -57,6 +57,7 @@ npm run smoke:socket                                        # direct to the back
 SMOKE_URL=http://127.0.0.1:5173 npm run smoke:socket        # through the Vite proxy (browser path)
 
 npm run verify:multiplayer                                  # two scripted clients: presence + proximity
+npm run verify:audio                                        # two scripted clients: real WebRTC audio (needs the server running)
 node scripts/bench-proximity.mjs                            # proximity/engine measurements, honestly labelled
 
 npm run lint         # eslint over client, server and scripts

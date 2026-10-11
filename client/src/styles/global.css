@@ -815,3 +815,111 @@ kbd {
     transition-duration: 0.001ms !important;
   }
 }
+
+/* ------------------------------------------------------------------ voice -- */
+
+.audio__controls {
+  display: flex;
+  gap: 8px;
+  margin-bottom: 8px;
+}
+
+.audio__controls .chip-button {
+  flex: 1;
+}
+
+.audio__status {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  margin: 0 0 4px;
+  font-size: 12px;
+  line-height: 1.45;
+  color: rgba(210, 220, 245, 0.86);
+}
+
+.chip-button--primary {
+  background: rgba(126, 224, 255, 0.16);
+  border-color: rgba(126, 224, 255, 0.46);
+  color: #d8f6ff;
+}
+
+.chip-button--warn {
+  background: rgba(255, 198, 120, 0.16);
+  border-color: rgba(255, 198, 120, 0.45);
+  color: #ffe6bd;
+}
+
+/*
+ * One dot, four meanings: grey (off), steady cyan (live), pulsing cyan (you are
+ * speaking), amber (connecting). Colour is never the only signal — the text beside
+ * it always says what is happening.
+ */
+.audio__dot {
+  width: 9px;
+  height: 9px;
+  border-radius: 50%;
+  flex: none;
+  background: rgba(150, 162, 190, 0.55);
+}
+
+.audio__dot--live {
+  background: #7ee0ff;
+  box-shadow: 0 0 0 3px rgba(126, 224, 255, 0.16);
+}
+
+.audio__dot--speaking {
+  animation: audio-pulse 0.9s ease-in-out infinite;
+}
+
+.audio__dot--pending {
+  background: #ffc678;
+  animation: audio-pulse 1.4s ease-in-out infinite;
+}
+
+@keyframes audio-pulse {
+  0%, 100% { box-shadow: 0 0 0 3px rgba(126, 224, 255, 0.14); }
+  50% { box-shadow: 0 0 0 7px rgba(126, 224, 255, 0.30); }
+}
+
+.audio__peers {
+  list-style: none;
+  margin: 8px 0 0;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 5px;
+}
+
+.audio__peer {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  font-size: 12px;
+}
+
+.audio__peer-name {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.audio__peer-state {
+  margin-left: auto;
+  font-size: 11px;
+  color: rgba(190, 202, 232, 0.75);
+}
+
+.audio__peer--failed .audio__peer-state {
+  color: #ffb0b0;
+}
+
+.audio__badge {
+  font-size: 10px;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+  padding: 1px 5px;
+  border-radius: 6px;
+  background: rgba(255, 198, 120, 0.18);
+  color: #ffe6bd;
+}

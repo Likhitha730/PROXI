@@ -10,7 +10,7 @@
 // and the stored position is what the client is resynced to.
 
 import { randomUUID } from 'node:crypto'
-import { createPlayerRecord, pickSpawnPoint } from '../../../shared/protocol.js'
+import { createAudioState, createPlayerRecord, pickSpawnPoint } from '../../../shared/protocol.js'
 
 export function createPlayerRegistry({ idFactory = randomUUID, now = Date.now } = {}) {
   /** @type {Map<string, { player: object, socketId: string, lastPosition: {x:number,y:number,at:number} }>} */
@@ -100,6 +100,29 @@ export function createPlayerRegistry({ idFactory = randomUUID, now = Date.now } 
     /** Where the server last accepted this player (anti-teleport baseline). */
     lastPosition(socketId) {
       return bySocketId.get(socketId)?.lastPosition ?? null
+    },
+
+    /**
+     * Replace a socket's audio eligibility.
+     *
+     * Like `move`, this is the only way the audio block changes, so a client cannot
+     * claim audio state for anyone but itself — the socket id decides whose record
+     * is touched, never a value from the payload.
+     *
+     * @returns {object|null} the updated player record, or null when not registered
+     */
+    setAudio(socketId, audio) {
+      const entry = bySocketId.get(socketId)
+      if (!entry) return null
+      const next = createAudioState({ ...entry.player.audio, ...audio })
+      if (
+        next.enabled === entry.player.audio.enabled &&
+        next.muted === entry.player.audio.muted
+      ) {
+        return entry.player // no change: do not create a new object for nothing
+      }
+      entry.player = Object.freeze({ ...entry.player, audio: next })
+      return entry.player
     },
 
     /**

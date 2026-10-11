@@ -89,6 +89,7 @@ vi.mock('socket.io-client', () => ({
 }))
 
 const { connectionStore } = await import('../state/connectionStore.js')
+const { audioEngine } = await import('../audio/audioEngine.js')
 const { presence } = await import('./presence.js')
 const socketClient = await import('./socketClient.js')
 
@@ -270,6 +271,126 @@ describe('publishing movement', () => {
     // an empty rename is ignored rather than clearing the name
     socketClient.setDisplayName('   ')
     expect(socketClient.getDisplayName()).toBe('Ada Lovelace')
+  })
+})
+
+describe('audio wiring', () => {
+  async function connectSocket() {
+    socketClient.connect()
+    currentSocket.simulateConnect()
+    await flush()
+  }
+
+  it('binds one listener per signalling event', async () => {
+    await connectSocket()
+
+    expect(currentSocket.countListeners(EVENTS.AUDIO_PEER)).toBe(1)
+    expect(currentSocket.countListeners(EVENTS.AUDIO_STATUS)).toBe(1)
+    expect(currentSocket.countListeners(EVENTS.SIGNAL_OFFER)).toBe(1)
+    expect(currentSocket.countListeners(EVENTS.SIGNAL_ANSWER)).toBe(1)
+    expect(currentSocket.countListeners(EVENTS.SIGNAL_ICE)).toBe(1)
+    expect(currentSocket.countListeners(EVENTS.SIGNAL_CLOSE)).toBe(1)
+  })
+
+  it('hands our player id to the engine from the join snapshot', async () => {
+    await connectSocket()
+    const setSelfId = vi.spyOn(audioEngine, 'setSelfId')
+
+    currentSocket.trigger(EVENTS.SNAPSHOT, { self: { id: 'player-me', name: 'Me', x: 1, y: 1 }, players: [] })
+
+    // Negotiation roles depend on it: the lexicographically larger id is the polite side.
+    expect(setSelfId).toHaveBeenCalledWith('player-me')
+    setSelfId.mockRestore()
+  })
+
+  it('forwards server audio events into the engine unchanged', async () => {
+    await connectSocket()
+    const peer = vi.spyOn(audioEngine, 'applyPeer')
+    const status = vi.spyOn(audioEngine, 'applyStatus').mockResolvedValue(true)
+
+    currentSocket.trigger(EVENTS.AUDIO_PEER, { peerId: 'player-a', name: 'Ada', enabled: true, muted: false, allowed: true })
+    currentSocket.trigger(EVENTS.AUDIO_STATUS, { peerId: 'player-a', status: 'ready', allowed: true })
+    await flush()
+
+    expect(peer).toHaveBeenCalledWith({ peerId: 'player-a', name: 'Ada', enabled: true, muted: false, allowed: true })
+    expect(status).toHaveBeenCalledWith({ peerId: 'player-a', status: 'ready', allowed: true })
+    peer.mockRestore()
+    status.mockRestore()
+  })
+
+  it('unwraps relayed offers, answers and ICE, using the server-derived sender id', async () => {
+    await connectSocket()
+    const signal = vi.spyOn(audioEngine, 'handleSignal').mockResolvedValue(true)
+    const ice = vi.spyOn(audioEngine, 'handleIce').mockResolvedValue(true)
+
+    currentSocket.trigger(EVENTS.SIGNAL_OFFER, { fromId: 'player-a', fromName: 'Ada', sdp: { type: 'offer', sdp: 'v=0-offer' } })
+    currentSocket.trigger(EVENTS.SIGNAL_ANSWER, { fromId: 'player-a', fromName: 'Ada', sdp: { type: 'answer', sdp: 'v=0-answer' } })
+    currentSocket.trigger(EVENTS.SIGNAL_ICE, { fromId: 'player-a', candidate: { candidate: 'candidate:1', sdpMid: '0', sdpMLineIndex: 0 } })
+
+    expect(signal).toHaveBeenNthCalledWith(1, 'player-a', { type: 'offer', sdp: 'v=0-offer' }, { fromName: 'Ada' })
+    expect(signal).toHaveBeenNthCalledWith(2, 'player-a', { type: 'answer', sdp: 'v=0-answer' }, { fromName: 'Ada' })
+    expect(ice).toHaveBeenCalledWith('player-a', { candidate: 'candidate:1', sdpMid: '0', sdpMLineIndex: 0 })
+    signal.mockRestore()
+    ice.mockRestore()
+  })
+
+  it('emits audio messages through the socket with the documented payload shapes', async () => {
+    await connectSocket()
+    // The engine receives a transport object; capture it to drive the socket directly.
+    const setTransport = vi.spyOn(audioEngine, 'setTransport')
+    socketClient.destroySocket()
+    currentSocket = createFakeSocket()
+    await connectSocket()
+
+    const transport = setTransport.mock.calls.at(-1)[0]
+    expect(Object.keys(transport).sort()).toEqual(['announce', 'answer', 'close', 'ice', 'offer'])
+
+    transport.announce({ enabled: true, muted: false })
+    transport.offer('player-a', { type: 'offer', sdp: 'v=0' })
+    transport.answer('player-a', { type: 'answer', sdp: 'v=0-answer' })
+    transport.ice('player-a', { candidate: 'candidate:1', sdpMid: '0', sdpMLineIndex: 0 })
+    transport.ice('player-a', null)
+    transport.close('player-a', 'hangup')
+
+    expect(currentSocket.emittedOf(EVENTS.AUDIO_READY)).toEqual([{ enabled: true, muted: false }])
+    expect(currentSocket.emittedOf(EVENTS.SIGNAL_OFFER)).toEqual([{ targetId: 'player-a', sdp: { type: 'offer', sdp: 'v=0' } }])
+    expect(currentSocket.emittedOf(EVENTS.SIGNAL_ANSWER)).toEqual([{ targetId: 'player-a', sdp: { type: 'answer', sdp: 'v=0-answer' } }])
+    expect(currentSocket.emittedOf(EVENTS.SIGNAL_ICE)).toEqual([
+      { targetId: 'player-a', candidate: { candidate: 'candidate:1', sdpMid: '0', sdpMLineIndex: 0 } },
+      { targetId: 'player-a', candidate: null },
+    ])
+    expect(currentSocket.emittedOf(EVENTS.SIGNAL_CLOSE)).toEqual([{ targetId: 'player-a', reason: 'hangup' }])
+    setTransport.mockRestore()
+  })
+
+  it('closes every audio session when the socket drops', async () => {
+    await connectSocket()
+    const drop = vi.spyOn(audioEngine, 'dropAllSessions')
+
+    currentSocket.disconnect()
+
+    expect(drop).toHaveBeenCalled()
+    drop.mockRestore()
+  })
+
+  it('revokes a peer who left the server', async () => {
+    await connectSocket()
+    const revoke = vi.spyOn(audioEngine, 'revoke')
+
+    currentSocket.trigger(EVENTS.LEFT, { id: 'player-a', name: 'Ada' })
+
+    expect(revoke).toHaveBeenCalledWith('player-a', { reason: 'peer_left' })
+    revoke.mockRestore()
+  })
+
+  it('ends a call when the peer sends signal:close', async () => {
+    await connectSocket()
+    const revoke = vi.spyOn(audioEngine, 'revoke')
+
+    currentSocket.trigger(EVENTS.SIGNAL_CLOSE, { fromId: 'player-a', reason: 'hangup' })
+
+    expect(revoke).toHaveBeenCalledWith('player-a', { reason: 'hangup' })
+    revoke.mockRestore()
   })
 })
 

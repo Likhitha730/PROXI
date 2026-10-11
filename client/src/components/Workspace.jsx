@@ -4,6 +4,7 @@ import { WorldCanvas } from './WorldCanvas.jsx'
 import { WorldControls } from './WorldControls.jsx'
 import { WorldPanel } from './WorldPanel.jsx'
 import { PresencePanel } from './PresencePanel.jsx'
+import { AudioPanel } from './AudioPanel.jsx'
 import { presence as presenceModel } from '../net/presence.js'
 import { WORLD_SUMMARY } from '../world/worldData.js'
 
@@ -23,7 +24,7 @@ function formatDuration(fromTimestamp) {
  * `engineVersion` counter exists only so the controls re-render once when the
  * engine becomes available.
  */
-export function Workspace({ connection, health, world, presence, onEngineReady }) {
+export function Workspace({ connection, health, world, presence, audio, onEngineReady }) {
   const targets = describeTargets()
   const databaseStatus = health.data?.database?.status ?? '—'
   const engineRef = useRef(null)
@@ -64,6 +65,8 @@ export function Workspace({ connection, health, world, presence, onEngineReady }
           connection={connection}
           onDismissError={() => presenceModel.clearError()}
         />
+
+        <AudioPanel audio={audio} connection={connection} />
 
         <section className="panel">
           <h3 className="panel__title">Session</h3>

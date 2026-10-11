@@ -11,7 +11,26 @@ const DEFAULTS = Object.freeze({
   socketUrl: '', // '' → same origin (Vite proxy in dev, Express in production)
   apiUrl: '', // '' → same origin
   appName: 'ProxiSpeak',
+  /*
+   * ICE overrides. Normally EMPTY: the server hands out its ICE configuration at
+   * /api/ice, which keeps TURN credentials out of this bundle (anything VITE_* is
+   * inlined into the shipped JavaScript and readable by anyone). Set these only for
+   * local experiments against a relay you control — and never with a long-lived
+   * credential. See docs/ARCHITECTURE.md §8.
+   */
+  iceStunUrls: '',
+  iceTurnUrl: '',
+  iceTurnUsername: '',
+  iceTurnCredential: '',
 })
+
+/*
+ * `import.meta.env` only exists under Vite: it is undefined when a client module is
+ * imported by plain Node — which is exactly what the verification scripts do
+ * (`scripts/verify-audio.mjs` drives the real audio engine headlessly). Falling
+ * back to an empty object keeps those scripts working without a build step.
+ */
+const viteEnv = import.meta.env ?? {}
 
 function readString(value, fallback) {
   if (typeof value !== 'string') return fallback
@@ -24,12 +43,16 @@ function stripTrailingSlash(url) {
 }
 
 export const env = Object.freeze({
-  mode: import.meta.env.MODE,
-  isDev: Boolean(import.meta.env.DEV),
-  isProd: Boolean(import.meta.env.PROD),
-  appName: readString(import.meta.env.VITE_APP_NAME, DEFAULTS.appName),
-  socketUrl: stripTrailingSlash(readString(import.meta.env.VITE_SOCKET_URL, DEFAULTS.socketUrl)),
-  apiUrl: stripTrailingSlash(readString(import.meta.env.VITE_API_URL, DEFAULTS.apiUrl)),
+  mode: viteEnv.MODE ?? 'test',
+  isDev: Boolean(viteEnv.DEV),
+  isProd: Boolean(viteEnv.PROD),
+  appName: readString(viteEnv.VITE_APP_NAME, DEFAULTS.appName),
+  socketUrl: stripTrailingSlash(readString(viteEnv.VITE_SOCKET_URL, DEFAULTS.socketUrl)),
+  apiUrl: stripTrailingSlash(readString(viteEnv.VITE_API_URL, DEFAULTS.apiUrl)),
+  iceStunUrls: readString(viteEnv.VITE_ICE_STUN_URLS, DEFAULTS.iceStunUrls),
+  iceTurnUrl: readString(viteEnv.VITE_ICE_TURN_URL, DEFAULTS.iceTurnUrl),
+  iceTurnUsername: readString(viteEnv.VITE_ICE_TURN_USERNAME, DEFAULTS.iceTurnUsername),
+  iceTurnCredential: readString(viteEnv.VITE_ICE_TURN_CREDENTIAL, DEFAULTS.iceTurnCredential),
 })
 
 /**

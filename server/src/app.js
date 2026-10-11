@@ -7,6 +7,7 @@ import { fileURLToPath } from 'node:url'
 import express from 'express'
 import { createCorsMiddleware, createErrorHandler, notFoundHandler } from './middleware/http.js'
 import { createHealthRouter } from './routes/health.js'
+import { createIceRouter } from './routes/ice.js'
 
 const here = path.dirname(fileURLToPath(import.meta.url))
 const CLIENT_DIST = path.resolve(here, '../../client/dist')
@@ -42,11 +43,15 @@ export function createApp({ config, logger }) {
     res.json({
       service: config.appName,
       version: config.version,
-      endpoints: ['/api/health'],
+      endpoints: ['/api/health', '/api/ice'],
     })
   })
 
   mountClientBuild(app, { config, logger })
+
+  // ICE configuration for WebRTC (kept out of the client bundle: TURN credentials
+  // are secrets and belong in the server environment — see src/routes/ice.js).
+  app.use('/api', createIceRouter({ config }))
 
   app.use(notFoundHandler)
   app.use(createErrorHandler({ logger }))

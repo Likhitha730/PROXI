@@ -61,9 +61,23 @@ Acceptance criteria: panel updates ≤ 5 Hz; lists exactly the users within rang
 
 ## Phase 5 — WebRTC Audio + Spatial Audio
 
-Tasks: proximity-filtered peer connections (450 units, 50-unit hysteresis); signaling relay; STUN; mic permission handling; Web Audio graph (distance gain + stereo pan per peer).
+Status: **voice implemented** (see [SESSION_06_REPORT.md](./SESSION_06_REPORT.md)); the
+spatial-audio half is **not** implemented. The listening radius is 100 units (not the
+450 units this plan originally guessed), with 12 units of hysteresis.
 
-Acceptance criteria: voice connects only within range; volume decreases and pan shifts with position; teardown on exit; mic denial degrades gracefully with a clear UI state.
+Implemented: proximity-filtered peer connections, server-authorized signalling relay
+with server-derived sender identity, per-session signalling rate limits, STUN/TURN
+configuration served from `/api/ice`, microphone consent on an explicit user action,
+mute, speaking/connection indicators, and teardown on revocation, hang-up or disconnect.
+
+Not implemented (deliberately deferred): the Web Audio graph — distance gain and stereo
+panning. Every call currently plays at full volume; `docs/ARCHITECTURE.md` §9 is marked
+as a design note for a later session.
+
+Acceptance criteria met: voice connects only within range; teardown on exit or when the
+listening radius is left; mic denial (and missing device, missing WebRTC) degrades
+gracefully with a clear UI state. Deferred: volume and pan following position, which
+depends on the unimplemented audio graph.
 
 ## Phase 6 — Persistence, Polish, Verification
 

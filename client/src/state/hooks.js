@@ -4,6 +4,7 @@ import { useCallback, useEffect, useState, useSyncExternalStore } from 'react'
 import { connectionStore } from './connectionStore.js'
 import { worldStore } from './worldStore.js'
 import { presence } from '../net/presence.js'
+import { audioEngine } from '../audio/audioEngine.js'
 import { apiUrl, describeTargets } from '../config/env.js'
 
 /** Subscribe to the Socket.IO connection state. */
@@ -30,6 +31,17 @@ export function useWorldState() {
  */
 export function usePresence() {
   return useSyncExternalStore(presence.subscribe, presence.getSnapshot, presence.getSnapshot)
+}
+
+/**
+ * Subscribe to the audio engine (microphone state, voice connections, speaking).
+ *
+ * The engine only notifies on state transitions — a peer connecting, the microphone
+ * opening, somebody starting or stopping speaking — never per audio sample, so this
+ * cannot drive a render loop.
+ */
+export function useAudio() {
+  return useSyncExternalStore(audioEngine.subscribe, audioEngine.getSnapshot, audioEngine.getSnapshot)
 }
 
 const HEALTH_POLL_MS = 10_000

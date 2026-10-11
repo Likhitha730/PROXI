@@ -28,6 +28,12 @@ export const DEFAULTS = Object.freeze({
   MONGODB_COLLECTION: 'positions',
   PROXIMITY_RADIUS: '100',
   POSITION_FLUSH_MS: '2000',
+  /**
+   * A public STUN server is enough for the common case (two browsers behind
+   * ordinary home routers). It is NOT enough for symmetric NAT or restrictive
+   * corporate networks — those need a TURN relay, configured below.
+   */
+  ICE_STUN_URLS: 'stun:stun.l.google.com:19302',
 })
 
 const VALID_LOG_LEVELS = new Set(['error', 'warn', 'info', 'debug'])
@@ -46,6 +52,21 @@ export function parseOriginList(value, fallback = DEFAULTS.CORS_ORIGIN) {
     .split(',')
     .map((origin) => origin.trim())
     .filter((origin) => origin.length > 0)
+}
+
+/** `"stun:a, turn:b"` → `["stun:a","turn:b"]`, dropping anything not stun/turn. */
+export function parseIceUrls(value, { key, fallback = '', schemes = ['stun', 'turn', 'turns'] } = {}) {
+  const raw = value === undefined || value === null ? fallback : String(value)
+  const urls = raw
+    .split(',')
+    .map((entry) => entry.trim())
+    .filter((entry) => entry.length > 0)
+  for (const url of urls) {
+    if (!schemes.some((scheme) => url.toLowerCase().startsWith(`${scheme}:`))) {
+      throw new Error(`${key} entries must start with ${schemes.join('/')} (received ${JSON.stringify(url)})`)
+    }
+  }
+  return urls
 }
 
 function parseInteger(value, { key, fallback, min, max }) {
@@ -102,6 +123,25 @@ export function parseConfig(source = {}) {
       min: 250,
       max: 60_000,
     }),
+
+    /*
+     * ICE / WebRTC connectivity.
+     *
+     * These are handed to browsers by GET /api/ice (they cannot work otherwise),
+     * which is exactly why TURN credentials must be ephemeral: generate short-lived
+     * ones and rotate them. They are never logged, and never committed — see
+     * server/.env.example.
+     */
+    iceStunUrls: Object.freeze(
+      parseIceUrls(source.ICE_STUN_URLS, { key: 'ICE_STUN_URLS', fallback: DEFAULTS.ICE_STUN_URLS, schemes: ['stun'] }),
+    ),
+    iceTurnUrl: (() => {
+      const url = read(source, 'ICE_TURN_URL') ?? null
+      if (url === null) return null
+      return parseIceUrls(url, { key: 'ICE_TURN_URL', schemes: ['turn', 'turns'] })[0] ?? null
+    })(),
+    iceTurnUsername: read(source, 'ICE_TURN_USERNAME') ?? null,
+    iceTurnCredential: read(source, 'ICE_TURN_CREDENTIAL') ?? null,
   })
 }
 

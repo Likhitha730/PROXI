@@ -2,6 +2,7 @@ import { useEffect, useRef, useState } from 'react'
 import { createWorldEngine } from '../render/engine.js'
 import { worldStore } from '../state/worldStore.js'
 import { presence } from '../net/presence.js'
+import { audioEngine } from '../audio/audioEngine.js'
 import { sendMove } from '../net/socketClient.js'
 
 /**
@@ -14,7 +15,7 @@ import { sendMove } from '../net/socketClient.js'
  *
  * Network integration is three callbacks, so the engine itself stays unaware of
  * Socket.IO:
- *   peerProvider     -> interpolated remote players, read every frame
+ *   peerProvider     -> interpolated remote players + their voice flags, per frame
  *   stateReporter    -> our own movement, published at <=15 Hz
  *   correctionSource -> authoritative position pushed by the server
  *   proximitySource  -> the listening radius the server reported (for the ring)
@@ -32,7 +33,9 @@ export function WorldCanvas({ playerName = 'You', spawnId, onEngineReady }) {
     let engine
     try {
       engine = createWorldEngine({ canvas, container, store: worldStore, playerName, spawnId })
-      engine.setPeerProvider((now) => presence.collectPeers(now))
+      // Voice flags ride along with the peer list so the avatars drawn this frame
+      // show who is talking; nothing here re-enters React.
+      engine.setPeerProvider((now) => audioEngine.annotatePeers(presence.collectPeers(now)))
       engine.setStateReporter((state) => sendMove(state))
       engine.setCorrectionSource(() => presence.takeCorrection())
       engine.setProximitySource(() => presence.getProximity())
