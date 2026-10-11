@@ -33,6 +33,11 @@ const proxy = {
 
 export default defineConfig({
   plugins: [react()],
+  test: {
+    // React component tests run in jsdom (declared per test file); this file
+    // enables act() support for all of them.
+    setupFiles: ['./src/test/setup.js'],
+  },
   server: {
     // Hard requirement: always port 5173, never silently pick another port.
     port: 5173,

@@ -2,11 +2,22 @@
 
 import { useCallback, useEffect, useState, useSyncExternalStore } from 'react'
 import { connectionStore } from './connectionStore.js'
+import { worldStore } from './worldStore.js'
 import { apiUrl, describeTargets } from '../config/env.js'
 
 /** Subscribe to the Socket.IO connection state. */
 export function useConnection() {
   return useSyncExternalStore(connectionStore.subscribe, connectionStore.getSnapshot, connectionStore.getSnapshot)
+}
+
+/**
+ * Subscribe to world/HUD state.
+ *
+ * The engine writes into this store at ~5 Hz, so the React tree re-renders a few
+ * times per second at most — never once per animation frame.
+ */
+export function useWorldState() {
+  return useSyncExternalStore(worldStore.subscribe, worldStore.getSnapshot, worldStore.getSnapshot)
 }
 
 const HEALTH_POLL_MS = 10_000
