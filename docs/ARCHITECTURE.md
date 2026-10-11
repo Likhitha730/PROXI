@@ -223,7 +223,7 @@ MediaStreamAudioSourceNode → GainNode (distance) → StereoPannerNode → dest
 
 - Unvalidated coordinates → anti-teleport + bounds checks (server).
 - Event flooding → per-socket rate limits on `position:update` and signaling events.
-- Secrets → `MONGODB_URI`, `CORS_ORIGIN` via env; `.env` gitignored; `.env.example` documents keys without values.
+- Secrets → `MONGODB_URI`, `CORS_ORIGIN` via env; `.env` gitignored; `.env.example` documents keys without values. The logger redacts sensitive keys **and scrubs string values** (`scrubSecrets`), so a connection string cannot leak through a driver error message.
 - XSS via display names → React escapes by default; canvas `fillText` is safe; still sanitize length/charset.
 - WebRTC permission errors → graceful degradation.
 - No auth in v1 → impersonation is possible; accepted risk, auth planned for a later session.

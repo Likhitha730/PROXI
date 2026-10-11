@@ -215,17 +215,21 @@ archived row can never pose as an active user.
 
 ## 6. Measured behaviour (what these numbers are, and are not)
 
-`node scripts/bench-proximity.mjs` — Node v22.22.3, linux/x64, this container, three
-runs per configuration. **Only the first block is a measurement of production code.**
+`node scripts/bench-proximity.mjs` — Node v22.22.3, linux/x64, this container, five
+runs per configuration on a **shared** machine. **Only the first block is a
+measurement of production code.** Variance between runs is large (the sandbox is
+shared and other processes come and go), so the numbers below are the observed
+spread, not a best case: the same 24-listener sweep measured 113 µs and 216 µs mean
+in different runs. Treat these as orders of magnitude, not as a specification.
 
 **In-memory proximity engine (real code path, registry-backed)**
 
 | Configuration | Mean | p50 | p95 | Throughput |
 |---|---|---|---|---|
-| Full room sweep, 24 listeners from one grid build | 113–125 µs | ~82 µs | 224–287 µs | ~8,000–8,800 sweeps/s |
+| Full room sweep, 24 listeners from one grid build | 113–216 µs | 82–161 µs | 224–353 µs | 4,600–8,800 sweeps/s |
 | One listener's neighbourhood (grid + hysteresis) | 7–11 µs | — | 8–18 µs | — |
 | Same, via an all-pairs scan (comparison) | 8–11 µs | — | 9–18 µs | — |
-| Full sweep, 200 listeners | ~1.9 ms | 1.7 ms | 2.6 ms | ~530 sweeps/s |
+| Full sweep, 200 listeners | ~1.9–5.7 ms | 1.7–5.5 ms | 2.6–7.7 ms | 175–530 sweeps/s |
 
 Two honest observations rather than a sales pitch:
 
@@ -241,8 +245,8 @@ Two honest observations rather than a sales pitch:
 
 | Operation | Mean | p95 |
 |---|---|---|
-| `savePosition` upsert | 47–53 µs | 117–164 µs |
-| `findNearby` planar `$near` | 47–60 µs | 59–81 µs |
+| `savePosition` upsert | 47–90 µs | 117–220 µs |
+| `findNearby` planar `$near` | 47–78 µs | 59–136 µs |
 
 These measure `server/src/test/fakeMongo.js`. **No MongoDB latency, throughput or index
 behaviour is measured or claimed in this session** — there is no server to measure.
@@ -271,6 +275,21 @@ SMOKE_URL=http://127.0.0.1:8080 node scripts/verify-multiplayer.mjs → 17/17 (d
 node scripts/smoke-socket.mjs                                       → 5/5
 curl /api/health → {"status":"ok", …, "realtime":{"socketio":true,"moveHz":15,"proximityRadius":100}}
 ```
+
+**Connection-string exposure, checked against the real driver** (not just the tests):
+the server was started three times with a deliberately unreachable database — once with
+`mongodb://leakuser:SuperSecretPw123@127.0.0.1:27099/proxi`, once with a
+credential-bearing `mongodb+srv://` URI whose host does not resolve, and once with no
+URI at all. In every case the credentials, the user name, the URI scheme and the
+database name appeared **zero times** across all log output and in `/api/health`, which
+reported only `{"status":"error","message":"MongoDB connection failed"}` while the
+server kept serving. The only connection detail that surfaces is the driver's own error
+text (`connect ECONNREFUSED 127.0.0.1:27099`, `querySrv ENOTFOUND …`) — a host and port,
+never a credential. That check found a genuine gap, which is fixed in this session: the
+logger redacted sensitive *keys* but passed string *values* through, so a URI embedded
+in a driver message or a validation reason would have been printed verbatim. Log values
+and messages are now scrubbed as well (`scrubSecrets` in `server/src/lib/logger.js`),
+with tests for both routes.
 
 The 7 new live checks: the radius is announced on join; a player is never listed as
 their own neighbour; someone outside the radius is not nearby; a **stationary** player
@@ -308,3 +327,5 @@ because there is no browser):
 * `spatialCheck` compares at most one player every 30 s; it is a smoke alarm for
   strategy drift, not a full audit.
 * WebRTC remained out of scope, as instructed.
+* Benchmark numbers are single-machine and shared-machine noisy (§6); rerun
+  `node scripts/bench-proximity.mjs` wherever a decision depends on them.
