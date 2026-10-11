@@ -10,7 +10,7 @@ export function lerp(a, b, t) {
 }
 
 export function lerpAngle(a, b, t) {
-  let d = ((b - a + Math.PI) % (Math.PI * 2)) - Math.PI
+  const d = ((b - a + Math.PI) % (Math.PI * 2)) - Math.PI
   return a + d * t
 }
 

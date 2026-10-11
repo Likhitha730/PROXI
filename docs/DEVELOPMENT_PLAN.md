@@ -10,7 +10,14 @@
 - Nothing is "done" until its acceptance criteria are executed and observed.
 - Frontend dev server: Vite port 5173 with `strictPort: true` — fail loudly if the port is occupied.
 
-## Phase 0 — Scaffolding (next session)
+## Phase 0 — Scaffolding ✅ (completed 2026-10-12, Session 1 implementation)
+
+> Session 1 implementation also delivered the first working vertical slice (application shell +
+> health endpoint + Socket.IO handshake). See [SESSION_02_REPORT.md](./SESSION_02_REPORT.md).
+> Verification note: the folder structure, package files, `vite.config.js` and `.env.example` files
+> now exist, dependencies are installed, and `npm run dev` runs both servers (failing loudly when
+> port 5173 is occupied) — all Phase 0 acceptance criteria are executed and observed.
+> Lint tooling is configured (`npm run lint`) and tests run via `npm test`.
 
 Tasks:
 
@@ -81,7 +88,14 @@ Phase 0, task 1–2: create the folder structure (`client/`, `server/`) and the 
 
 ## Session Log
 
-- **Session 1 (2026-10-12) — Documentation baseline: complete and verified.** Requirements, architecture,
+- **Session 0 (2026-10-12) — Documentation baseline: complete and verified.** Requirements, architecture,
   development plan and `.gitignore` are in place and cover every required topic; no application code
   written and no dependencies installed. Findings and open decisions are recorded in
-  [SESSION_01_REPORT.md](./SESSION_01_REPORT.md). Next: Phase 0, tasks 1–2.
+  [SESSION_01_REPORT.md](./SESSION_01_REPORT.md).
+- **Session 1 (2026-10-12) — Phase 0 + application shell: complete, verified.** React/Vite shell on port
+  5173 (strictPort), Express + Socket.IO on 8080 attached to one HTTP server, `GET /api/health`,
+  explicit `CORS_ORIGIN` allow-list, safe connect/disconnect logging, MongoDB placeholders, graceful
+  shutdown, npm scripts for dev/build/start/lint/test/smoke. 39 automated tests pass, lint is clean,
+  and all manual checks (frontend load, health, browser-path Socket.IO, port-conflict failure,
+  production serving, shutdown) were executed. See [SESSION_02_REPORT.md](./SESSION_02_REPORT.md).
+  Next: Phase 1 — Canvas world rendering and camera.
