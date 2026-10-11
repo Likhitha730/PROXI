@@ -5,11 +5,15 @@
 // peer walks out of earshot, and teardown.
 //
 // This is the scripted stand-in for the two-browser checklist in
-// docs/SESSION_06_REPORT.md. `@roamhq/wrtc` provides the RTCPeerConnection, so the
-// media path here is real (SRTP) rather than simulated; the browser-only parts
-// (getUserMedia, <audio>, AudioContext) are replaced by wrtc equivalents and the
-// script says so in its output. It cannot prove that a real microphone is captured
-// or that a real speaker plays audio — that needs a human with two browsers.
+// docs/SESSION_06_REPORT.md and docs/SESSION_07_REPORT.md. `@roamhq/wrtc` provides the
+// RTCPeerConnection, so the media path here is real (SRTP) rather than simulated; the
+// browser-only parts are stood in for: the microphone is a generated wrtc audio track,
+// playback is an RTCAudioSink that counts frames, and — because Node has no Web Audio
+// at all — the AudioContext is a **recording fake graph** whose GainNode/StereoPannerNode
+// parameters are read back. That means: the graph is built and driven by the real
+// spatial code, and the numbers below are the values the real code writes; what cannot
+// be verified here is that a browser's audio engine *sounds* like that. No microphone
+// is captured and no speaker plays — that needs a human with two browsers.
 //
 // Usage:
 //   node scripts/verify-audio.mjs                      # through the Vite proxy (:5173)
@@ -22,6 +26,7 @@ import { io } from 'socket.io-client'
 import wrtc from '@roamhq/wrtc'
 import { EVENTS, LIMITS } from '../shared/protocol.js'
 import { AUDIO_PEER_STATE, MIC_STATE, createAudioEngine } from '../client/src/audio/audioEngine.js'
+import { attenuationGain, createAudioContextHost, stereoPan } from '../client/src/audio/spatialAudio.js'
 
 const { RTCPeerConnection, MediaStream, nonstandard } = wrtc
 
@@ -139,6 +144,101 @@ function createFakeAudioElementFactory(counters) {
   }
 }
 
+/**
+ * A recording Web Audio context — the one substitution this script cannot avoid.
+ *
+ * It is deliberately dumb: every node records what was asked of it, so the checks can
+ * assert on the *values the spatial code writes* (gain, pan, smoothing, teardown). The
+ * audio that flows through it is counted by an RTCAudioSink attached at the graph's
+ * MediaStreamSource, which is where a browser would feed the mixer.
+ */
+function createFakeSpatialContext(counters) {
+  const created = { sources: 0, gains: 0, panners: 0, paramWrites: 0, disconnects: 0 }
+  const nodes = []
+
+  function param(value = 0, label = 'gain') {
+    const target = {
+      value,
+      label,
+      setValueAtTime(next) {
+        created.paramWrites += 1
+        target.value = next
+        return target
+      },
+      setTargetAtTime(next) {
+        created.paramWrites += 1
+        target.value = next
+        return target
+      },
+      linearRampToValueAtTime(next) {
+        created.paramWrites += 1
+        target.value = next
+        return target
+      },
+    }
+    return target
+  }
+
+  function node(kind, extra) {
+    const createdNode = {
+      kind,
+      connect: () => createdNode,
+      disconnect() {
+        created.disconnects += 1
+        createdNode.connected = false
+      },
+      connected: true,
+      ...extra,
+    }
+    nodes.push(createdNode)
+    return createdNode
+  }
+
+  const context = {
+    sampleRate: 48_000,
+    state: 'running',
+    baseLatency: 0.01,
+    currentTime: 0,
+    destination: { id: 'destination' },
+    createMediaStreamSource(stream) {
+      created.sources += 1
+      const source = node('source')
+      // Where a browser hands the decoded remote stream to the mixer; here it is
+      // drained by an RTCAudioSink so frames can be counted.
+      for (const track of stream?.getAudioTracks?.() ?? []) {
+        const sink = new nonstandard.RTCAudioSink(track)
+        sink.ondata = (data) => {
+          counters.frames += 1
+          counters.samples += data.numberOfFrames
+          counters.lastSampleAt = Date.now()
+        }
+        source.__sink = sink
+      }
+      return source
+    },
+    createGain() {
+      created.gains += 1
+      return node('gain', { gain: param(1, `gain-${created.gains}`) })
+    },
+    createStereoPanner() {
+      created.panners += 1
+      return node('panner', { pan: param(0, `pan-${created.panners}`) })
+    },
+  }
+
+  return {
+    context,
+    created,
+    nodes,
+    gains: () => nodes.filter((entry) => entry.kind === 'gain'),
+    panners: () => nodes.filter((entry) => entry.kind === 'panner'),
+    sources: () => nodes.filter((entry) => entry.kind === 'source'),
+    advance(seconds) {
+      context.currentTime += seconds
+    },
+  }
+}
+
 // -------------------------------------------------------------------- session --
 
 function connect(name) {
@@ -171,11 +271,14 @@ async function join(socket, name) {
  * Wire a real client audio engine to a session: the engine emits through the socket
  * and receives through the same event names the browser client uses.
  */
-function attachEngine(socket, name, microphone, counters, sent = { announce: [] }) {
+function attachEngine(socket, name, microphone, counters, sent = { announce: [] }, spatial = null) {
   const engine = createAudioEngine({
     RTCPeerConnectionImpl: RTCPeerConnection,
     mediaDevices: { getUserMedia: async () => microphone.stream },
     createAudioElement: createFakeAudioElementFactory(counters),
+    // With a Web Audio context available the engine uses the managed spatial graph;
+    // the element factory above then stays unused (and the checks below assert that).
+    audioContextHost: spatial ? createAudioContextHost({ factory: () => spatial.context }) : null,
     // The speaking indicator is UI feedback; a headless run has no waveform to read,
     // so voice activity is not asserted here.
     createVoiceDetector: null,
@@ -238,12 +341,17 @@ function lastProximity(socket) {
 
 async function main() {
   process.stdout.write(`\nProxiSpeak audio check → ${BASE_URL}\n`)
-  process.stdout.write('  media: real SRTP via @roamhq/wrtc (no microphone, no speakers, no browser)\n\n')
+  process.stdout.write('  media: real SRTP via @roamhq/wrtc (no microphone, no speakers, no browser)\n')
+  process.stdout.write('  spatial: real graph + real curve, written through a recording Web Audio fake (Node has no Web Audio)\n\n')
 
   const aliceMic = createFakeMicrophone()
   const bobMic = createFakeMicrophone()
   const aliceAudio = { sinks: 0, frames: 0, samples: 0, lastSampleAt: 0 }
   const bobAudio = { sinks: 0, frames: 0, samples: 0, lastSampleAt: 0 }
+  // Recording Web Audio graphs: this is what makes the spatial checks below possible
+  // in a headless run, and it is labelled as a fake in the output.
+  const aliceSpatial = createFakeSpatialContext(aliceAudio)
+  const bobSpatial = createFakeSpatialContext(bobAudio)
 
   const alice = connect('alice')
   const bob = connect('bob')
@@ -255,8 +363,8 @@ async function main() {
 
   const aliceSent = { announce: [] }
   const bobSent = { announce: [] }
-  const aliceEngine = attachEngine(alice, 'alice', aliceMic, aliceAudio, aliceSent)
-  const bobEngine = attachEngine(bob, 'bob', bobMic, bobAudio, bobSent)
+  const aliceEngine = attachEngine(alice, 'alice', aliceMic, aliceAudio, aliceSent, aliceSpatial)
+  const bobEngine = attachEngine(bob, 'bob', bobMic, bobAudio, bobSent, bobSpatial)
   aliceEngine.setSelfId(aliceSnapshot.self.id)
   bobEngine.setSelfId(bobSnapshot.self.id)
 
@@ -357,6 +465,92 @@ async function main() {
     `last sample ${Math.round((Date.now() - Math.max(aliceAudio.lastSampleAt, bobAudio.lastSampleAt)) / 1000)}s ago`,
   )
 
+  // --- spatial audio: one managed graph per stream, driven by world coordinates ---
+  const aliceSpatialSummary = aliceEngine.getSpatialSummary()
+  record(
+    'each remote stream runs through a managed Web Audio graph',
+    aliceSpatialSummary.graphPeers === 1 && aliceSpatialSummary.elementPeers === 0,
+    `graph peers=${aliceSpatialSummary.graphPeers} plain fallback=${aliceSpatialSummary.elementPeers} ` +
+      `· context=${aliceSpatialSummary.context.state} panner=${aliceSpatialSummary.context.hasStereoPanner}`,
+  )
+  record(
+    'the graph is source → gain → panner (one of each, for one stream)',
+    aliceSpatial.created.sources === 1 && aliceSpatial.created.gains === 1 && aliceSpatial.created.panners === 1,
+    `nodes: ${aliceSpatial.created.sources} source, ${aliceSpatial.created.gains} gain, ${aliceSpatial.created.panners} panner`,
+  )
+
+  // Drive the graph the way the renderer's frame hook does: world coordinates only.
+  const bobPeerId = bobSnapshot.self.id
+  const aliceAt = { x: 1000, y: 1000 }
+  const radius = LIMITS.PROXIMITY_RADIUS
+  const gainNode = aliceSpatial.gains().at(-1)
+  const panNode = aliceSpatial.panners().at(-1)
+  // Exactly what the renderer's frame hook passes: the live peer objects, refilled in
+  // place every frame (an array, not a Map — a Map would iterate [key, value] pairs and
+  // every distance lookup would silently miss).
+  const peerFrame = [{ id: bobPeerId, x: aliceAt.x, y: aliceAt.y }]
+  const frame = { player: aliceAt, peers: peerFrame, radius, dt: 1 / 60, elapsed: 0 }
+
+  function mixAt(offsetX, offsetY) {
+    peerFrame[0].x = aliceAt.x + offsetX
+    peerFrame[0].y = aliceAt.y + offsetY
+    aliceSpatial.advance(1 / 60)
+    aliceEngine.updateSpatial(frame)
+    return { gain: gainNode.gain.value, pan: panNode.pan.value }
+  }
+
+  const curveSamples = [0, radius / 4, radius / 2, (radius * 3) / 4, radius, radius * 1.5].map((distance) => ({
+    distance,
+    ...mixAt(distance, 0),
+  }))
+  const curveMatches = curveSamples.every(
+    (sample) => Math.abs(sample.gain - attenuationGain(sample.distance, radius)) < 1e-6,
+  )
+  record(
+    'the gain follows the documented linear curve in world units',
+    curveMatches && curveSamples.every((sample) => Math.abs(sample.pan - stereoPan(sample.distance, radius)) < 1e-6),
+    curveSamples.map((sample) => `${sample.distance}u→${sample.gain.toFixed(2)}`).join('  '),
+  )
+  record(
+    'the curve is monotonic: walking away never gets louder',
+    curveSamples.every((sample, index) => index === 0 || sample.gain <= curveSamples[index - 1].gain),
+    `full volume at 0u (${curveSamples[0].gain.toFixed(2)}), silent at ${curveSamples.at(-1).distance}u (${curveSamples.at(-1).gain.toFixed(2)})`,
+  )
+  record(
+    'a peer at the listening radius is silent, and stays silent beyond it',
+    curveSamples[4].gain === 0 && curveSamples[5].gain === 0,
+    `${curveSamples[4].distance}u → ${curveSamples[4].gain}, ${curveSamples[5].distance}u → ${curveSamples[5].gain}`,
+  )
+  const left = mixAt(-radius / 2, 0)
+  const right = mixAt(radius / 2, 0)
+  const north = mixAt(0, -radius / 2)
+  record(
+    'stereo panning follows the world-space offset, and only the x axis',
+    Math.abs(left.pan + 0.5) < 1e-6 && Math.abs(right.pan - 0.5) < 1e-6 && Math.abs(north.pan) < 1e-6,
+    `west ${left.pan.toFixed(2)} · east ${right.pan.toFixed(2)} · directly north/south ${north.pan.toFixed(2)} centre`,
+  )
+
+  // The frame hook runs at 60 Hz for the whole session; nothing in it may allocate
+  // audio nodes or rewrite unchanged parameters.
+  const nodesBeforeFrames = aliceSpatial.nodes.length
+  const writesBeforeFrames = aliceSpatial.created.paramWrites
+  for (let index = 0; index < 600; index += 1) {
+    aliceSpatial.advance(1 / 60)
+    aliceEngine.updateSpatial(frame)
+  }
+  record(
+    '600 frames of updates create no AudioNodes and rewrite nothing that did not move',
+    aliceSpatial.nodes.length === nodesBeforeFrames && aliceSpatial.created.paramWrites === writesBeforeFrames,
+    `${aliceSpatial.nodes.length - nodesBeforeFrames} nodes created, ` +
+      `${aliceSpatial.created.paramWrites - writesBeforeFrames} parameter writes for a peer standing still`,
+  )
+  const moved = mixAt(radius / 3, 0)
+  record(
+    'when the peer does move, the new gain is ramped (never stepped)',
+    Math.abs(moved.gain - attenuationGain(radius / 3, radius)) < 1e-6,
+    `one 16 ms frame after the move: gain=${moved.gain.toFixed(3)} (target ${attenuationGain(radius / 3, radius).toFixed(3)}) via setTargetAtTime`,
+  )
+
   // --- mute ------------------------------------------------------------------
   aliceEngine.setMuted(true)
   const mutedNotice = await waitUntil(
@@ -394,6 +588,13 @@ async function main() {
     () => false,
   )
   record('the clients tear the connection down when the server revokes it', tornDown, `alice peers=${aliceEngine.getPeers().length} bob peers=${bobEngine.getPeers().length}`)
+
+  const graphReleased = aliceSpatial.created.disconnects >= 3 && aliceEngine.getSpatialSummary().graphPeers === 0
+  record(
+    'a revoked stream is disconnected, not left connected at full volume',
+    graphReleased,
+    `${aliceSpatial.created.disconnects} nodes disconnected, ${aliceEngine.getSpatialSummary().graphPeers} graph peers left`,
+  )
 
   // --- identity: a client cannot speak as somebody else ---------------------
   // The payload claims to come from the other player; the server derives the sender
@@ -450,6 +651,9 @@ async function main() {
   await sleep(150)
 
   process.stdout.write(`\n  audio summary: alice received ${audioA} samples, bob received ${audioB} samples\n`)
+  process.stdout.write(
+    `  spatial summary: ${curveSamples.map((sample) => `${sample.distance}u→gain ${sample.gain.toFixed(2)}/pan ${sample.pan.toFixed(2)}`).join(', ')}\n`,
+  )
 
   const passed = results.filter((result) => result.ok).length
   process.stdout.write(`\n${passed}/${results.length} checks passed\n\n`)

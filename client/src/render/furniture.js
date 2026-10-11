@@ -171,10 +171,13 @@ function propDeskPlant(ctx, x, y) {
   for (let i = 0; i < 7; i += 1) {
     const angle = kit.range(0, Math.PI * 2)
     const radius = kit.range(2, 8)
+    // Leaves lean with the ambient breeze; the pot stays put, so the movement reads
+    // as growth rather than as the object sliding around.
+    const lean = sway(i * 1.7, 0.7, 1.25) * (0.4 + radius / 8)
     ellipse(
       ctx,
-      x + Math.cos(angle) * radius,
-      y - 3 + Math.sin(angle) * radius * 0.7,
+      x + Math.cos(angle) * radius + lean,
+      y - 3 + Math.sin(angle) * radius * 0.7 + lean * 0.35,
       kit.range(3.4, 5.6),
       kit.range(2.8, 4.6),
       i % 2 === 0 ? PALETTE.plant.leaf : PALETTE.plant.leafDark,
@@ -620,8 +623,10 @@ export const FURNITURE_DRAWERS = {
     for (let i = 0; i < clusters; i += 1) {
       const angle = kit.range(0, Math.PI * 2)
       const radius = kit.range(w * 0.08, w * 0.44)
-      const cx = Math.cos(angle) * radius
-      const cy = -h * 0.16 + Math.sin(angle) * radius * 0.8
+      // Taller, lighter clusters move further — a canopy swaying, not a rigid blob.
+      const lean = sway(i * 2.3, w * 0.018, 0.95)
+      const cx = Math.cos(angle) * radius + lean
+      const cy = -h * 0.16 + Math.sin(angle) * radius * 0.8 + lean * 0.4
       const rx = kit.range(w * 0.18, w * 0.3)
       ellipse(ctx, cx, cy, rx, rx * 0.82, kit.pick(leafColours))
     }
@@ -629,7 +634,8 @@ export const FURNITURE_DRAWERS = {
     for (let i = 0; i < 3; i += 1) {
       const angle = kit.range(0, Math.PI * 2)
       const radius = kit.range(w * 0.05, w * 0.22)
-      ellipse(ctx, Math.cos(angle) * radius, -h * 0.2 + Math.sin(angle) * radius * 0.7, w * 0.12, w * 0.1, withAlpha('#bfe8c9', 0.5))
+      const lean = sway(i * 3.1, w * 0.012, 1.05)
+      ellipse(ctx, Math.cos(angle) * radius + lean, -h * 0.2 + Math.sin(angle) * radius * 0.7 + lean * 0.4, w * 0.12, w * 0.1, withAlpha('#bfe8c9', 0.5))
     }
   },
 
@@ -699,6 +705,34 @@ export const FURNITURE_DRAWERS = {
     fillRoundRect(ctx, -15, -10, 30, 20, 2, PALETTE.screen.glowSoft)
     ctx.restore()
   },
+}
+
+/**
+ * Ambient motion state, shared by the drawers below.
+ *
+ * A module-level clock rather than a parameter on forty drawer functions: it is two
+ * numbers, it never allocates, and when `motion` is false (the user asked for reduced
+ * motion, or the scene is settling) every decorative animation in here stops without
+ * the caller having to say so per item.
+ */
+const ambient = { time: 0, motion: true }
+
+/** Called once per frame by the world engine. */
+export function setAmbientMotion(time, motion = true) {
+  ambient.time = Number.isFinite(time) ? time : 0
+  ambient.motion = Boolean(motion)
+  return ambient
+}
+
+/** Current ambient state (tests + diagnostics; the object is reused). */
+export function getAmbientMotion() {
+  return ambient
+}
+
+/** A cheap per-item sway offset, in world units. Zero when motion is off. */
+function sway(seed, amplitude = 1.6, speed = 1.1) {
+  if (!ambient.motion) return 0
+  return Math.sin(ambient.time * speed + seed) * amplitude
 }
 
 /** Furniture types that have a drawer (used by tests to catch typos). */

@@ -4,11 +4,14 @@ A premium, real-time virtual office. Users control animated avatars in a polishe
 HTML5 Canvas; when avatars come within earshot, a WebRTC audio channel opens automatically and voices
 are rendered with distance-based volume and stereo panning.
 
-> **Current milestone — Session 1: application shell.**
-> React/Vite frontend shell, Express + Socket.IO backend, health endpoint, CORS allow-list, safe
-> connection logging, MongoDB integration placeholders and graceful shutdown.
-> Avatar movement, world rendering, presence/proximity, MongoDB geospatial queries and WebRTC are
-> **not implemented yet** — see [`docs/DEVELOPMENT_PLAN.md`](docs/DEVELOPMENT_PLAN.md).
+> **Current milestone — Session 7: spatial audio + 2D interaction polish.**
+> Each voice stream now runs through its own managed Web Audio graph: distance attenuation in **world
+> units** (`gain = clamp(1 - distance / listeningRadius, 0, 1)`), stereo panning where the browser
+> supports it, and parameter automation so volume never steps. The 2D world gained idle animation,
+> proximity rings, a smooth speaking indicator, hover/selection feedback, live reduced-motion
+> handling and a responsive layout that keeps world coordinates intact.
+> Details, measurements and the limits of what could be verified are in
+> [`docs/SESSION_07_REPORT.md`](docs/SESSION_07_REPORT.md).
 
 ## Stack
 
@@ -59,6 +62,7 @@ SMOKE_URL=http://127.0.0.1:5173 npm run smoke:socket        # through the Vite p
 npm run verify:multiplayer                                  # two scripted clients: presence + proximity
 npm run verify:audio                                        # two scripted clients: real WebRTC audio (needs the server running)
 node scripts/bench-proximity.mjs                            # proximity/engine measurements, honestly labelled
+npm run bench:render                                        # frame-loop + spatial-audio measurements vs avatar count
 
 npm run lint         # eslint over client, server and scripts
 npm test             # client unit tests + server unit/integration tests (Vitest, no DB needed)
@@ -120,7 +124,28 @@ connection and releases the microphone and every audio element.
   leave the rest of the app working.
 * **Mute** stops sending audio without tearing the call down; the peer sees a `muted` badge.
 * The **Voice** panel shows the microphone state in words, one row per voice connection with
-  speaking/connecting state, and the listening radius in use.
+  speaking/connecting state, the distance to that peer and the level the graph is mixing it at, and
+  the listening radius in use.
+
+### Spatial audio
+
+Every remote stream gets a **managed Web Audio graph** — `MediaStreamSource → GainNode → StereoPanner
+→ destination` — created once when the stream arrives and disconnected when it ends. There is exactly
+**one volume control per stream** (the graph's gain; the media element is only used as a fallback when
+Web Audio is unavailable, and then it carries the pan and nothing else):
+
+* **Distance is measured in world units, never screen pixels.** The camera zoom changes how large the
+  office looks, not how loud a colleague is; the picking radius for the mouse is the only thing that
+  scales with zoom, because a click target has to stay comfortable on screen.
+* `gain = clamp(1 - distance / listeningRadius, 0, 1)` — the documented, linear starting curve. The
+  radius is the same configurable value the proximity engine uses.
+* `pan = clamp(dx / listeningRadius, -1, 1)` where `dx` is the world-space horizontal offset, applied
+  through a `StereoPannerNode` **when the browser has one**; without it the stream stays centred.
+* Transitions use `AudioParam.setTargetAtTime` (gain τ = 60 ms, pan τ = 80 ms) and unchanged values are
+  skipped, so walking around produces no clicks and no parameter spam.
+* The `AudioContext` is created lazily and **resumed from a user gesture** (enabling the microphone);
+  a suspended context is reported in the panel instead of failing silently. Muted, disconnected and
+  revoked peers fade to silence before their nodes are released.
 
 ### Connectivity and TURN
 
@@ -198,9 +223,10 @@ Architectural rules kept in this milestone: `world/` and `render/` stay pure, `n
 client-side I/O boundary, `state/` holds the observable model, and Socket.IO/Express code is the only
 server-side I/O boundary.
 
-## Session 1 verification
+## Verification
 
-Executed results are recorded in [`docs/SESSION_02_REPORT.md`](docs/SESSION_02_REPORT.md).
+Every session records what it actually ran — see the `docs/SESSION_0*_REPORT.md` files. The commands
+above are the current ones; `npm test` and `npm run lint` cover client, server and scripts.
 
 ## Roadmap
 
@@ -213,7 +239,8 @@ Executed results are recorded in [`docs/SESSION_02_REPORT.md`](docs/SESSION_02_R
 | Phase 3 | Presence + movement sync, remote interpolation | done |
 | Phase 4 | Proximity detection, nearby panel | done |
 | Phase 5 | WebRTC voice (proximity-gated, peer-to-peer) | done — see `docs/SESSION_06_REPORT.md` |
-| Phase 5b | Spatial audio: distance gain + stereo panning | **not implemented** (deferred) |
+| Phase 5b | Spatial audio: distance gain + stereo panning | done — see `docs/SESSION_07_REPORT.md` |
+| Phase 5c | 2D polish: idle poses, hover/selection, ambient motion, reduced motion | done — see `docs/SESSION_07_REPORT.md` |
 | Phase 6 | MongoDB persistence, polish, E2E verification | done (persistence: `docs/SESSION_05_REPORT.md`) |
 
 Per-session detail lives in `docs/SESSION_0*_REPORT.md`; each report states what was verified and what

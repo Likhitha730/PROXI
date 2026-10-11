@@ -17,7 +17,7 @@ import {
   ZONE_BY_ID,
 } from '../world/worldData.js'
 import { PALETTE, floorPalette, shade, withAlpha } from './palette.js'
-import { body, ellipse, roundRectPath } from './furniture.js'
+import { body, ellipse, getAmbientMotion, roundRectPath } from './furniture.js'
 
 const LABEL_FONT = "600 12px ui-sans-serif, system-ui, -apple-system, 'Segoe UI', Roboto, sans-serif"
 const SUBLABEL_FONT = "500 10px ui-sans-serif, system-ui, -apple-system, 'Segoe UI', Roboto, sans-serif"
@@ -264,7 +264,10 @@ export function drawLightPools(ctx, camera) {
     gradient.addColorStop(0.55, `rgba(255, 246, 219, ${0.16 * (overlay.intensity ?? 0.5)})`)
     gradient.addColorStop(1, 'rgba(255, 246, 219, 0)')
     ctx.save()
-    ctx.globalAlpha = 0.55
+    // A very slow breathing of the pools (no allocation — just a scalar) so the room
+    // feels lit rather than painted. Static when the user prefers reduced motion.
+    const ambient = getAmbientMotion()
+    ctx.globalAlpha = ambient.motion ? 0.53 + Math.sin(ambient.time * 0.6 + cx * 0.01) * 0.045 : 0.55
     ctx.beginPath()
     ctx.ellipse(cx, cy, rect.w / 2, rect.h / 2, 0, 0, Math.PI * 2)
     ctx.fillStyle = gradient

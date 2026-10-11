@@ -2,7 +2,7 @@ import { useEffect, useRef, useState } from 'react'
 import { createWorldEngine } from '../render/engine.js'
 import { worldStore } from '../state/worldStore.js'
 import { presence } from '../net/presence.js'
-import { audioEngine } from '../audio/audioEngine.js'
+import { MIC_STATE, audioEngine } from '../audio/audioEngine.js'
 import { sendMove } from '../net/socketClient.js'
 
 /**
@@ -36,6 +36,9 @@ export function WorldCanvas({ playerName = 'You', spawnId, onEngineReady }) {
       // Voice flags ride along with the peer list so the avatars drawn this frame
       // show who is talking; nothing here re-enters React.
       engine.setPeerProvider((now) => audioEngine.annotatePeers(presence.collectPeers(now)))
+      // Spatial audio: one gain/pan update per peer per frame, from world
+      // coordinates. It allocates nothing and creates no audio nodes.
+      engine.setFrameHook((frame) => audioEngine.updateSpatial(frame))
       engine.setStateReporter((state) => sendMove(state))
       engine.setCorrectionSource(() => presence.takeCorrection())
       engine.setProximitySource(() => presence.getProximity())
@@ -47,7 +50,19 @@ export function WorldCanvas({ playerName = 'You', spawnId, onEngineReady }) {
       return undefined
     }
 
+    // The local microphone's speaking/mute state feeds the same indicators the peers
+    // use. This subscription fires on *transitions* (a few times a sentence), not per
+    // frame, so it costs nothing in the animation loop.
+    const unsubscribeVoice = audioEngine.subscribe(() => {
+      const snapshot = audioEngine.getSnapshot()
+      engine.setLocalVoice({
+        speaking: audioEngine.isSpeaking() && snapshot.mic === MIC_STATE.ACTIVE && !snapshot.muted,
+        muted: snapshot.muted,
+      })
+    })
+
     return () => {
+      unsubscribeVoice()
       engine?.destroy()
       onEngineReady?.(null)
     }

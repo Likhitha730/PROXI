@@ -25,6 +25,13 @@
 import { LIMITS } from '../../../shared/protocol.js'
 import { resolveIceServers } from './iceConfig.js'
 import { createVoiceDetector as createDefaultVoiceDetector } from './voiceActivity.js'
+import {
+  attenuationGain,
+  createAudioContextHost,
+  createSpatialSink,
+  gainToPercent,
+  stereoPan,
+} from './spatialAudio.js'
 
 /** Connection states surfaced to the UI (never inferred from audio contents). */
 export const AUDIO_PEER_STATE = Object.freeze({
@@ -53,7 +60,17 @@ const INITIAL_SNAPSHOT = Object.freeze({
   peers: Object.freeze([]),
   iceSource: null,
   hasTurn: false,
+  /** The listening radius the spatial graph attenuates against (world units). */
+  listeningRadius: LIMITS.PROXIMITY_RADIUS,
+  /** Web Audio availability, for the UI: `running` means attenuation is live. */
+  audioContext: Object.freeze({ state: 'idle', sampleRate: null, latency: null, hasStereoPanner: false }),
 })
+
+/**
+ * How often the spatial read-out (distance / level) may be published to the React
+ * tree. 4 Hz: the same budget the proximity list uses, and far below the frame rate.
+ */
+const SPATIAL_READOUT_INTERVAL_MS = 250
 
 /** Audio constraints: voice, with the browser's own processing where available. */
 const AUDIO_CONSTRAINTS = Object.freeze({
@@ -134,10 +151,17 @@ export function createAudioEngine({
   createAudioElement = defaultAudioElementFactory,
   createVoiceDetector = createDefaultVoiceDetector,
   iceResolver = resolveIceServers,
+  // --- spatial audio ---
+  /** The shared AudioContext host; created lazily and resumed on a user gesture. */
+  audioContextHost = null,
+  /** Sink factory — swapped in tests to observe gain/pan without real audio. */
+  createSink = createSpatialSink,
+  /** Explicit listening radius (world units); when null the server's radius wins. */
+  listeningRadius = null,
   now = () => Date.now(),
   logger = null,
 } = {}) {
-  /** @type {Map<string, object>} peerId -> { pc, state, remoteStream, audioElement, detectors } */
+  /** @type {Map<string, object>} peerId -> { pc, state, remoteStream, sink, handlers } */
   const peers = new Map()
   const listeners = new Set()
 
@@ -152,6 +176,24 @@ export function createAudioEngine({
   let localSpeaking = false
   let lastError = null
   let generation = 0
+  /** Radius override, or null to follow the server-reported proximity radius. */
+  let radiusOverride = Number.isFinite(listeningRadius) && listeningRadius > 0 ? listeningRadius : null
+  const contextHost = audioContextHost ?? createAudioContextHost({ logger })
+  /**
+   * Reused every frame by `updateSpatial`: allocating here would put garbage in the
+   * animation loop, which is exactly what this session is supposed to avoid.
+   */
+  const spatialFrame = { peers: 0, updated: 0, radius: LIMITS.PROXIMITY_RADIUS, silent: 0, readout: 0 }
+
+  /**
+   * The last time the HUD's spatial read-out was published.
+   *
+   * The graph updates 60 times a second, but the numbers a human reads (distance in
+   * whole world units, level in whole percent) must not re-render the React tree at
+   * that rate. Same rule as the presence layer: at most 4 per second, and only when a
+   * displayed number actually changed.
+   */
+  let lastReadoutAt = 0
 
   /** Injected by the net layer; every outbound message goes through it. */
   let transport = {
@@ -176,7 +218,15 @@ export function createAudioEngine({
   function rebuildSnapshot(patch = {}) {
     voiceMap.clear()
     for (const entry of peers.values()) {
-      voiceMap.set(entry.id, { speaking: Boolean(entry.speaking), muted: Boolean(entry.muted), state: entry.state })
+      voiceMap.set(entry.id, {
+        speaking: Boolean(entry.speaking),
+        muted: Boolean(entry.muted),
+        state: entry.state,
+        // Spatial read-out for the renderer's labels: the distance the graph is
+        // attenuating against and the level it is mixing at. Display only.
+        distance: entry.distance,
+        volumePercent: gainToPercent(entry.spatialGain),
+      })
     }
     const peerList = [...peers.values()].map((entry) =>
       Object.freeze({
@@ -186,6 +236,12 @@ export function createAudioEngine({
         muted: entry.muted,
         speaking: entry.speaking,
         direction: entry.polite ? 'polite' : 'impolite',
+        // Spatial audio, for the HUD: world-space distance and the level the graph
+        // is mixing this peer at. Purely a read-out — the graph owns the real value.
+        distance: Number.isFinite(entry.distance) ? Math.round(entry.distance) : null,
+        gain: Math.max(0, Math.min(1, entry.spatialGain < 0 ? 0 : entry.spatialGain)),
+        volumePercent: gainToPercent(entry.spatialGain),
+        usesGraph: Boolean(entry.usesGraph),
       }),
     )
     snapshot = Object.freeze({
@@ -197,12 +253,21 @@ export function createAudioEngine({
       enabled,
       iceSource: iceConfig?.source ?? null,
       hasTurn: Boolean(iceConfig?.hasTurn),
+      listeningRadius: radiusOverride ?? LIMITS.PROXIMITY_RADIUS,
+      audioContext: Object.freeze(contextHost.describe()),
       peers: Object.freeze(peerList),
       ...patch,
     })
     for (const listener of listeners) listener()
     return snapshot
   }
+
+  // A context can be suspended by the browser (tab hidden, device change) long after
+  // the click that started it; the UI should say so rather than claim audio is live.
+  contextHost.subscribe(() => {
+    if (peers.size === 0 && !enabled && !localStream) return
+    rebuildSnapshot()
+  })
 
   function updatePeerSnapshot(id, patch) {
     const entry = peers.get(id)
@@ -213,46 +278,49 @@ export function createAudioEngine({
 
 
   /**
-   * Attach a remote stream to an <audio> element.
+   * Give a remote stream its own managed audio graph.
    *
-   * Autoplay can be blocked until the user has interacted with the page; because
-   * enabling the microphone *is* that interaction, a rejection here is rare — when
-   * it happens the peer is flagged so the UI can offer a play button instead of
-   * silently playing nothing.
+   * Web Audio is preferred: it is what makes attenuation possible at all. When it is
+   * unavailable (or the context cannot be created) the engine falls back to a plain
+   * `<audio>` element, and the UI reports that attenuation is off — an honest
+   * "no graph" beats silently pretending to attenuate.
    */
   function attachRemoteStream(id, stream) {
     const entry = peers.get(id)
     if (!entry || !stream) return
     entry.remoteStream = stream
-    if (!entry.audioElement) entry.audioElement = createAudioElement?.() ?? null
-    const element = entry.audioElement
-    if (!element) return
+    if (entry.sink) return // one graph per stream, never two
 
-    element.srcObject = stream
-    const played = element.play?.()
+    const context = contextHost.getContext()
+    entry.sink = createSink({
+      stream,
+      context,
+      createElement: createAudioElement,
+    })
+    entry.usesGraph = entry.sink?.kind === 'webaudio'
+    // The element, when used, can still refuse to autoplay; surface that rather
+    // than playing nothing in silence.
+    const played = entry.sink?.element?.play?.()
     if (played?.catch) {
       played.catch((error) => {
-        // Never fatal, and never about audio *content* — just autoplay policy.
         updatePeerSnapshot(id, { blocked: true })
         log.warn('remote audio could not autoplay', { peerId: id, reason: error?.name })
       })
     }
+    rebuildSnapshot()
   }
 
+  /** Release one peer's audio graph, detector and stream references. */
   function releaseRemoteStream(id) {
     const entry = peers.get(id)
     if (!entry) return
     entry.mediaDetector?.stop?.()
     entry.mediaDetector = null
-    if (entry.audioElement) {
-      try {
-        entry.audioElement.srcObject = null
-        entry.audioElement.pause?.()
-      } catch {
-        /* the element may already be detached */
-      }
-      entry.audioElement.remove?.()
-      entry.audioElement = null
+    if (entry.sink) {
+      // Fades to silence, then detaches every node it created.
+      entry.sink.dispose()
+      entry.sink = null
+      entry.usesGraph = false
     }
     entry.remoteStream = null
   }
@@ -288,8 +356,13 @@ export function createAudioEngine({
       makingOffer: false,
       ignoreOffer: false,
       remoteStream: null,
-      audioElement: null,
+      sink: null,
+      usesGraph: false,
       mediaDetector: null,
+      /** Last values pushed to the graph — used to skip no-op parameter updates. */
+      spatialGain: -1,
+      spatialPan: 0,
+      distance: null,
       startedAt: now(),
       pendingCandidates: [],
     }
@@ -596,6 +669,11 @@ export function createAudioEngine({
       const myGeneration = ++generation
       if (enabled && localStream) return snapshot
 
+      // This call comes from the user's click, which is the only place a browser
+      // lets us start audio. Doing it here means remote voices are audible the
+      // moment the first stream arrives, instead of waiting for another gesture.
+      await contextHost.resume()
+
       const stream = await startLocalMedia()
       if (!stream || myGeneration !== generation) return snapshot
 
@@ -717,6 +795,150 @@ export function createAudioEngine({
       return onRemoteIce(id, candidate)
     },
 
+    /**
+     * The per-frame spatial update, called from the world engine's animation loop.
+     *
+     * Reads **world coordinates** from the peer list the renderer already
+     * interpolates, and writes two AudioParams. It allocates nothing: no nodes, no
+     * objects, no strings. A peer that has not moved enough to change what you hear
+     * costs two comparisons.
+     *
+     * @param {{ player?: {x:number,y:number}, peers?: Iterable<object>, radius?: number }} frame
+     *   `frame.peers` is the renderer's reused peer list; `radius` is the listening
+     *   radius in world units (the server's, or the explicit override).
+     */
+    updateSpatial(frame) {
+      const player = frame?.player
+      if (!player || peers.size === 0) {
+        spatialFrame.peers = peers.size
+        spatialFrame.updated = 0
+        return spatialFrame
+      }
+
+      // The renderer hands us its own interpolated peer objects; remembering each
+      // one's position by reference means the graph reads the live world coordinate
+      // every frame without copying anything.
+      if (frame.peers) {
+        for (const peer of frame.peers) {
+          const entry = peers.get(peer.id)
+          if (!entry) continue
+          if (entry.worldPosition) {
+            entry.worldPosition.x = peer.x
+            entry.worldPosition.y = peer.y
+          } else {
+            entry.worldPosition = { x: peer.x, y: peer.y }
+          }
+        }
+      }
+
+      const radius =
+        radiusOverride ?? (Number.isFinite(frame?.radius) && frame.radius > 0 ? frame.radius : LIMITS.PROXIMITY_RADIUS)
+      let updated = 0
+      let silent = 0
+      let readoutChanged = false
+
+      for (const entry of peers.values()) {
+        if (!entry.sink) continue
+        // The sink takes the spatial values; everything else (mute) happens upstream
+        // by not sending audio, so there is never a second volume control to fight.
+        const peerPosition = entry.worldPosition
+        const x = Number.isFinite(peerPosition?.x) ? peerPosition.x : Number.NaN
+        const y = Number.isFinite(peerPosition?.y) ? peerPosition.y : Number.NaN
+        if (!Number.isFinite(x) || !Number.isFinite(y)) {
+          entry.sink.setActive(false)
+          silent += 1
+          continue
+        }
+
+        const dx = x - player.x
+        const dy = y - player.y
+        const distance = Math.hypot(dx, dy)
+        const gain = entry.state === AUDIO_PEER_STATE.CONNECTED ? attenuationGain(distance, radius) : 0
+        const pan = stereoPan(dx, radius)
+
+        const changed = Math.abs(gain - entry.spatialGain) > 0.002 || Math.abs(pan - entry.spatialPan) > 0.005
+        if (changed) {
+          entry.sink.setSpatial(gain, pan)
+          entry.spatialGain = gain
+          entry.spatialPan = pan
+          updated += 1
+        }
+        entry.distance = distance
+        const whole = Math.round(distance)
+        const percent = gainToPercent(gain)
+        if (entry.readoutDistance !== whole || entry.readoutPercent !== percent) {
+          entry.readoutDistance = whole
+          entry.readoutPercent = percent
+          readoutChanged = true
+        }
+      }
+
+      // Publish the read-out for the panel: never per frame, and never when nothing a
+      // human could read has moved.
+      if (readoutChanged && now() - lastReadoutAt >= SPATIAL_READOUT_INTERVAL_MS) {
+        lastReadoutAt = now()
+        spatialFrame.readout += 1
+        rebuildSnapshot()
+      }
+
+      spatialFrame.peers = peers.size
+      spatialFrame.updated = updated
+      spatialFrame.radius = radius
+      spatialFrame.silent = silent
+      return spatialFrame
+    },
+
+    /**
+     * The renderer knows where each peer is in world space before we do; it hands the
+     * position over every frame so the graph never reads a stale coordinate. The
+     * object is stored by reference — no copy, no allocation.
+     */
+    setPeerWorldPosition(id, x, y) {
+      const entry = peers.get(id)
+      if (!entry) return false
+      if (entry.worldPosition) {
+        entry.worldPosition.x = x
+        entry.worldPosition.y = y
+      } else {
+        entry.worldPosition = { x, y }
+      }
+      return true
+    },
+
+    /** Radius override (world units); null/undefined follows the server's radius. */
+    setListeningRadius(radius) {
+      radiusOverride = Number.isFinite(radius) && radius > 0 ? radius : null
+      rebuildSnapshot()
+      return radiusOverride
+    },
+
+    /** Web Audio availability + the radius the graph is using, for the UI. */
+    getSpatialSummary() {
+      const context = contextHost.describe()
+      let graphPeers = 0
+      let elementPeers = 0
+      for (const entry of peers.values()) {
+        if (entry.usesGraph) graphPeers += 1
+        else if (entry.sink) elementPeers += 1
+      }
+      return {
+        context,
+        graphPeers,
+        elementPeers,
+        listeningRadius: radiusOverride ?? LIMITS.PROXIMITY_RADIUS,
+        lastFrame: { ...spatialFrame },
+      }
+    },
+
+    /** Resume the shared AudioContext — call from a user gesture. */
+    resumeAudio() {
+      return contextHost.resume()
+    },
+
+    subscribeAudioContext(listener) {
+      return contextHost.subscribe(listener)
+    },
+
     /** Diagnostics for tests and the debug panel. */
     getPeers() {
       return [...peers.values()].map((entry) => ({
@@ -761,6 +983,9 @@ export function createAudioEngine({
     /**
      * Stamp voice flags onto the renderer's peer objects (in place — the list is
      * reused every frame, so this allocates nothing).
+     *
+     * The voice map only changes on a state transition, which is why this is a few
+     * property writes per peer rather than a rebuilding pass.
      */
     annotatePeers(list) {
       for (const peer of list ?? []) {
@@ -768,6 +993,8 @@ export function createAudioEngine({
         if (flags) {
           peer.speaking = flags.speaking
           peer.muted = flags.muted
+          if (flags.distance !== undefined) peer.distance = flags.distance
+          if (flags.volumePercent !== undefined) peer.volumePercent = flags.volumePercent
         } else if (peer.speaking || peer.muted) {
           peer.speaking = false
           peer.muted = false
@@ -782,6 +1009,8 @@ export function createAudioEngine({
       knownPeers.clear()
       for (const id of [...peers.keys()]) closePeer(id)
       stopLocalMedia()
+      // Tear the graph host down too: a context left open holds an audio device.
+      contextHost.dispose()
       enabled = false
       micState = MIC_STATE.IDLE
       micError = null

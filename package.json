@@ -15,7 +15,8 @@
     "smoke:socket": "node scripts/smoke-socket.mjs",
     "verify:multiplayer": "node scripts/verify-multiplayer.mjs",
     "verify:audio": "node scripts/verify-audio.mjs",
-    "bench:proximity": "node scripts/bench-proximity.mjs"
+    "bench:proximity": "node scripts/bench-proximity.mjs",
+    "bench:render": "node --expose-gc client/scripts/bench-render.mjs --heap"
   },
   "devDependencies": {
     "@roamhq/wrtc": "^0.10.0",

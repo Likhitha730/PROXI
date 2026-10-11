@@ -207,6 +207,92 @@ describe('AudioPanel', () => {
     expect(text()).toContain('does not support WebRTC')
   })
 
+  it('shows the per-peer distance and the level the spatial graph mixes at', () => {
+    const audio = createAudioStub({
+      enabled: true,
+      mic: MIC_STATE.ACTIVE,
+      listeningRadius: 100,
+      peers: [
+        {
+          id: 'ada',
+          name: 'Ada',
+          state: 'connected',
+          speaking: false,
+          muted: false,
+          distance: 25,
+          volumePercent: 75,
+          usesGraph: true,
+        },
+      ],
+    })
+    mount(<AudioPanel audio={audio} connection={CONNECTED} />)
+
+    const meter = container.querySelector('[data-testid="audio-peer-level-ada"]')
+    // The number under the name is the same number the graph is mixing at, so it can
+    // be read as an answer rather than as decoration.
+    expect(meter.getAttribute('data-level')).toBe('75')
+    expect(meter.textContent).toContain('25 u')
+    expect(meter.textContent).toContain('75%')
+    expect(meter.getAttribute('title')).toContain('distance 25 u')
+    expect(meter.querySelector('.audio__meter-fill').style.width).toBe('75%')
+    expect(container.querySelector('[data-testid="audio-summary"]').textContent).toContain('listening radius 100 u')
+  })
+
+  it('says which engine is behind the sound, and never claims attenuation it does not have', () => {
+    const audio = createAudioStub({
+      listeningRadius: 100,
+      audioContext: { state: 'running', sampleRate: 48000, latency: 0.01, hasStereoPanner: true },
+      peers: [
+        { id: 'ada', name: 'Ada', state: 'connected', usesGraph: true },
+        { id: 'grace', name: 'Grace', state: 'connected', usesGraph: false },
+      ],
+    })
+    mount(<AudioPanel audio={audio} connection={CONNECTED} />)
+
+    const state = container.querySelector('[data-testid="audio-engine-state"]').textContent
+    expect(state).toContain('stereo panning on')
+    expect(state).toContain('48000 Hz')
+    expect(text()).toContain('linear · full volume to 50 u, silent at 100 u (world units)')
+    // One stream is on the fallback: the panel says so instead of pretending.
+    const graph = container.querySelector('[data-testid="audio-engine-graph"]').textContent
+    expect(graph).toContain('1 of 2 streams through the spatial graph')
+    expect(graph).toContain('1 plain (no attenuation)')
+  })
+
+  it('explains a suspended or unavailable AudioContext in plain language', () => {
+    mount(
+      <AudioPanel
+        audio={createAudioStub({ audioContext: { state: 'suspended', sampleRate: 48000, hasStereoPanner: true } })}
+        connection={CONNECTED}
+      />,
+    )
+    expect(container.querySelector('[data-testid="audio-engine-state"]').textContent).toContain(
+      'press the microphone button',
+    )
+
+    rerender(
+      <AudioPanel
+        audio={createAudioStub({ audioContext: { state: 'unavailable', hasStereoPanner: false } })}
+        connection={CONNECTED}
+      />,
+    )
+    expect(container.querySelector('[data-testid="audio-engine-state"]').textContent).toContain(
+      'audio plays without attenuation',
+    )
+    expect(container.querySelector('[data-testid="audio-engine-graph"]').textContent).toBe('no remote streams')
+  })
+
+  it('stops metering a peer who is only connecting', () => {
+    const audio = createAudioStub({
+      peers: [{ id: 'ada', name: 'Ada', state: 'connecting', distance: 25, volumePercent: 75, usesGraph: true }],
+    })
+    mount(<AudioPanel audio={audio} connection={CONNECTED} />)
+
+    // There is no volume to report before a stream exists — a meter here would be a lie.
+    expect(container.querySelector('[data-testid="audio-peer-level-ada"]')).toBeNull()
+    expect(container.querySelector('[data-testid="audio-peer-ada"]').textContent).toContain('connecting')
+  })
+
   it('renders safely before the engine has produced a snapshot', () => {
     mount(<AudioPanel audio={undefined} connection={undefined} />)
 

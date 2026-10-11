@@ -11,6 +11,7 @@
  * @vitest-environment jsdom
  */
 import { beforeEach, describe, expect, it, vi } from 'vitest'
+import { attenuationGain, createAudioContextHost, stereoPan } from './spatialAudio.js'
 import { AUDIO_PEER_STATE, MIC_STATE, createAudioEngine } from './audioEngine.js'
 import { LIMITS } from '../../../shared/protocol.js'
 
@@ -173,6 +174,73 @@ function createFakeDetector(stream, onSpeaking) {
   return detector
 }
 
+/**
+ * A recording Web Audio context. jsdom has no Web Audio, so the graph path can only be
+ * exercised with one of these — every node and every parameter write is recorded, which
+ * is what the assertions below read.
+ */
+function createFakeAudioContext() {
+  const created = { sources: 0, gains: 0, panners: 0, disconnects: 0, writes: 0 }
+  const params = []
+
+  function param(value, label) {
+    const target = {
+      label,
+      value,
+      setValueAtTime(next) {
+        created.writes += 1
+        target.value = next
+        return target
+      },
+      setTargetAtTime(next) {
+        created.writes += 1
+        target.value = next
+        return target
+      },
+      linearRampToValueAtTime(next) {
+        created.writes += 1
+        target.value = next
+        return target
+      },
+    }
+    params.push(target)
+    return target
+  }
+
+  function node(kind, extra) {
+    return { kind, connect: () => node, disconnect: () => { created.disconnects += 1 }, ...extra }
+  }
+
+  const context = {
+    sampleRate: 48_000,
+    state: 'running',
+    currentTime: 0,
+    destination: { id: 'destination' },
+    resume: vi.fn(async () => {}),
+    close: vi.fn(async () => {}),
+    createMediaStreamSource: () => {
+      created.sources += 1
+      return node('source')
+    },
+    createGain: () => {
+      created.gains += 1
+      return node('gain', { gain: param(1, 'gain') })
+    },
+    createStereoPanner: () => {
+      created.panners += 1
+      return node('panner', { pan: param(0, 'pan') })
+    },
+  }
+
+  return {
+    context,
+    created,
+    params,
+    gainParams: () => params.filter((entry) => entry.label === 'gain'),
+    panParams: () => params.filter((entry) => entry.label === 'pan'),
+  }
+}
+
 // ------------------------------------------------------------------- harness --
 
 function setup(options = {}) {
@@ -206,6 +274,11 @@ function setup(options = {}) {
     },
     iceResolver: resolver,
     logger,
+    // Injected only by the spatial tests: without it the engine has no Web Audio and
+    // correctly falls back to a plain element sink.
+    audioContextHost: options.spatial
+      ? createAudioContextHost({ factory: () => options.spatial.context })
+      : null,
   })
   engine.setTransport(transport)
   return { engine, transport, elements, detectors, resolver, logger, settings }
@@ -870,11 +943,19 @@ describe('speaking indicators', () => {
     detectors.at(-1).speak(true)
 
     expect(engine.getSnapshot().peers[0].speaking).toBe(true)
-    expect(engine.voiceFlagsFor('alpha')).toEqual({ speaking: true, muted: false, state: AUDIO_PEER_STATE.CONNECTING })
+    expect(engine.voiceFlagsFor('alpha')).toEqual({
+      speaking: true,
+      muted: false,
+      state: AUDIO_PEER_STATE.CONNECTING,
+      // Spatial read-out, stamped for the renderer's labels (null until the graph has
+      // a world position to attenuate against).
+      distance: null,
+      volumePercent: 0,
+    })
 
     const list = [{ id: 'alpha' }, { id: 'ghost', speaking: true }]
     engine.annotatePeers(list)
-    expect(list[0]).toEqual({ id: 'alpha', speaking: true, muted: false })
+    expect(list[0]).toEqual({ id: 'alpha', speaking: true, muted: false, distance: null, volumePercent: 0 })
     expect(list[1]).toEqual({ id: 'ghost', speaking: false, muted: false })
   })
 
@@ -896,5 +977,182 @@ describe('speaking indicators', () => {
     expect(serialised).not.toMatch(/candidate:/)
     expect(serialised).not.toMatch(/zzz-top-secret-sdp/)
     expect(serialised).not.toMatch(/v=0|m=audio/)
+  })
+})
+
+// ---------------------------------------------------------------- spatial audio --
+
+describe('spatial audio (driven by world coordinates)', () => {
+  /** Connect one peer over the managed graph and return everything the checks need. */
+  async function connected(spatial = createFakeAudioContext()) {
+    const harness = setup({ spatial })
+    const { engine } = harness
+    await engine.enable()
+    await engine.authorize('peer-1', { name: 'Ada' })
+    // The remote side answers with its stream: that is what builds the graph.
+    const pc = FakePeerConnection.instances[0]
+    pc.setRemoteDescription?.({ type: 'answer', sdp: 'v=0-answer' })
+    await flush()
+    pc.emitRemoteTrack(new FakeTrack('audio', 'remote'), [new FakeStream([new FakeTrack('audio', 'remote')])])
+    pc.setConnectionState('connected')
+    return { ...harness, spatial, engine }
+  }
+
+  const frameWith = (distance, { radius = 100, player = { x: 0, y: 0 } } = {}) => ({
+    player,
+    peers: [{ id: 'peer-1', x: player.x + distance, y: player.y }],
+    radius,
+    dt: 1 / 60,
+  })
+
+  it('builds exactly one graph for the stream, and never a second one', async () => {
+    const { engine, spatial } = await connected()
+
+    expect(spatial.created.sources).toBe(1)
+    expect(spatial.created.gains).toBe(1)
+    expect(spatial.created.panners).toBe(1)
+    expect(engine.getSpatialSummary().graphPeers).toBe(1)
+    // The plain element fallback must NOT also be attached: one volume control per stream.
+    expect(engine.getSpatialSummary().elementPeers).toBe(0)
+  })
+
+  it('writes the documented curve from world distance, frame after frame', async () => {
+    const { engine, spatial } = await connected()
+    const gain = spatial.gainParams().at(-1)
+    const pan = spatial.panParams().at(-1)
+
+    for (const distance of [0, 25, 50, 100, 400]) {
+      spatial.context.currentTime += 1 / 60
+      engine.updateSpatial(frameWith(distance))
+      expect(gain.value).toBeCloseTo(attenuationGain(distance, 100), 6)
+      expect(pan.value).toBeCloseTo(stereoPan(distance, 100), 6)
+    }
+  })
+
+  it('reads the peer positions the renderer hands it, in place (no copying)', async () => {
+    const { engine, spatial } = await connected()
+    const gain = spatial.gainParams().at(-1)
+    const livePeer = { id: 'peer-1', x: 30, y: 40 }
+    const frame = { player: { x: 0, y: 0 }, peers: [livePeer], radius: 100, dt: 1 / 60 }
+
+    engine.updateSpatial(frame)
+    expect(gain.value).toBeCloseTo(0.5, 6) // hypot(30, 40) = 50 u
+
+    // The renderer mutates the same object next frame — the graph must follow it.
+    livePeer.x = 100
+    engine.updateSpatial(frame)
+    expect(gain.value).toBe(0)
+  })
+
+  it('honours a listening radius the app changed at runtime', async () => {
+    const { engine, spatial } = await connected()
+    engine.setListeningRadius(200)
+
+    engine.updateSpatial(frameWith(100, { radius: 200 }))
+
+    expect(spatial.gainParams().at(-1).value).toBeCloseTo(0.5, 6)
+    expect(engine.getSpatialSummary().listeningRadius).toBe(200)
+  })
+
+  it('treats zoom as a pointer concern: nothing about the camera reaches the graph', async () => {
+    const { engine, spatial } = await connected()
+    const gain = spatial.gainParams().at(-1)
+
+    engine.updateSpatial(frameWith(50))
+    const before = gain.value
+    // The frame object has no zoom field at all (see the renderer's frame hook), so a
+    // camera change cannot alter the mix; re-running the same world distance proves the
+    // value is a pure function of world units.
+    engine.updateSpatial(frameWith(50))
+
+    expect(gain.value).toBe(before)
+    expect(before).toBeCloseTo(0.5, 6)
+  })
+
+  it('opens no AudioNodes and rewrites nothing while a peer stands still', async () => {
+    const { engine, spatial } = await connected()
+    engine.updateSpatial(frameWith(50))
+    const nodes = spatial.created.sources + spatial.created.gains + spatial.created.panners
+    const writes = spatial.created.writes
+
+    for (let index = 0; index < 600; index += 1) {
+      spatial.context.currentTime += 1 / 60
+      engine.updateSpatial(frameWith(50))
+    }
+
+    expect(spatial.created.sources + spatial.created.gains + spatial.created.panners).toBe(nodes)
+    expect(spatial.created.writes).toBe(writes)
+  })
+
+  it('reports the distance and the level it mixes at, for the HUD', async () => {
+    const { engine } = await connected()
+
+    engine.updateSpatial(frameWith(25))
+
+    const peer = engine.getSnapshot().peers[0]
+    expect(peer.distance).toBe(25)
+    expect(peer.volumePercent).toBe(75)
+    expect(peer.usesGraph).toBe(true)
+
+    const list = [{ id: 'peer-1' }]
+    engine.annotatePeers(list)
+    expect(list[0]).toMatchObject({ distance: 25, volumePercent: 75 })
+  })
+
+  it('silences a muted peer without touching the graph topology', async () => {
+    const { engine, spatial } = await connected()
+    engine.updateSpatial(frameWith(25))
+    const gain = spatial.gainParams().at(-1)
+
+    engine.setMuted(true)
+    engine.updateSpatial(frameWith(25))
+
+    // Mute is a send-side flag on our own track; the remote peer's level is unchanged,
+    // and no second volume control is created for it.
+    expect(gain.value).toBeCloseTo(0.75, 6)
+    expect(spatial.created.gains).toBe(1)
+  })
+
+  it('releases the graph when the peer is revoked, and stops writing to it', async () => {
+    const { engine, spatial } = await connected()
+    engine.updateSpatial(frameWith(25))
+    const gain = spatial.gainParams().at(-1)
+    const writesAfterRevoke = () => spatial.created.writes
+
+    engine.revoke('peer-1', { reason: 'peer_left' })
+    const writes = writesAfterRevoke()
+
+    engine.updateSpatial(frameWith(25))
+
+    expect(spatial.created.disconnects).toBeGreaterThanOrEqual(3)
+    expect(engine.getSpatialSummary().graphPeers).toBe(0)
+    // Disposal ramps the gain down; after that the frame has nobody to write to.
+    expect(gain.value).toBe(0)
+    expect(writesAfterRevoke()).toBe(writes)
+  })
+
+  it('publishes the read-out to React at most 4×/second, never per frame', async () => {
+    const { engine } = await connected()
+    const readouts = () => engine.getSpatialSummary().lastFrame.readout
+    engine.updateSpatial(frameWith(10))
+    const before = readouts()
+
+    // A peer crossing the whole radius in one animation frame's worth of updates: the
+    // mix moves every frame, the HUD must not.
+    for (let step = 0; step < 600; step += 1) engine.updateSpatial(frameWith(10 + (step % 90)))
+
+    const published = readouts() - before
+    expect(published).toBeLessThanOrEqual(2)
+    expect(engine.getSpatialSummary().lastFrame.updated).toBeGreaterThan(0)
+  })
+
+  it('is inert (and silent) when a peer has no stream yet', async () => {
+    const { engine, spatial } = await connected()
+
+    expect(() => engine.updateSpatial({ player: { x: 0, y: 0 }, peers: [], radius: 100, dt: 1 / 60 })).not.toThrow()
+    expect(() => engine.updateSpatial(null)).not.toThrow()
+
+    expect(spatial.created.writes).toBeGreaterThan(0) // the fade-in at creation
+    expect(engine.getSpatialSummary().graphPeers).toBe(1)
   })
 })

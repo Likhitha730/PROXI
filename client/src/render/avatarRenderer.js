@@ -317,14 +317,26 @@ function drawHead(ctx, appearance, pose, bob, time, blink) {
     }
   }
 
-  // speaking: a small pulse ring around the head
-  if (pose.speaking) {
-    const pulse = 0.5 + 0.5 * Math.sin(time * 7)
+  // speaking: a ring whose opacity and reach follow the *smoothed* speaking level,
+  // so it swells while somebody talks and settles when they stop. With reduced motion
+  // it still appears — the information matters — but it stops pulsing.
+  const level = pose.speakingLevel ?? 0
+  if (level > 0.01) {
+    const pulse = pose.reducedMotion ? 0.5 : 0.5 + 0.5 * Math.sin(time * 7)
+    const reach = r + 4 + pulse * 2.6 * level
     ctx.beginPath()
-    ctx.arc(0, 1, r + 4 + pulse * 2.6, 0, Math.PI * 2)
-    ctx.strokeStyle = withAlpha(PALETTE.accents.green, 0.32 + pulse * 0.28)
-    ctx.lineWidth = 1.8
+    ctx.arc(0, 1, reach, 0, Math.PI * 2)
+    ctx.strokeStyle = withAlpha(PALETTE.accents.green, 0.22 + pulse * 0.3 + level * 0.22)
+    ctx.lineWidth = 1.4 + level * 0.8
     ctx.stroke()
+    // A second, fainter ring lags behind, which reads as sound spreading outward.
+    if (!pose.reducedMotion && level > 0.35) {
+      ctx.beginPath()
+      ctx.arc(0, 1, r + 7 + pulse * 4 * level, 0, Math.PI * 2)
+      ctx.strokeStyle = withAlpha(PALETTE.accents.green, 0.12 * level)
+      ctx.lineWidth = 1.2
+      ctx.stroke()
+    }
   }
   if (pose.muted) {
     ctx.beginPath()
@@ -519,8 +531,24 @@ export function drawAvatar(ctx, avatar, options = {}) {
   pose.isLocal = avatar.isLocal
   pose.speaking = avatar.speaking
   pose.muted = avatar.muted
+  // Smoothed 0..1 speaking level (the engine eases it) — drives the indicator so it
+  // fades in and out instead of blinking on and off between syllables.
+  pose.speakingLevel = avatar.speakingLevel ?? (avatar.speaking ? 1 : 0)
+  pose.reducedMotion = Boolean(options.reducedMotion)
+  pose.selected = Boolean(options.selected)
+  pose.hovered = Boolean(options.hovered)
 
-  const breathing = avatar.moving ? 0 : Math.sin(time * 1.7) * 0.55
+  // Idle pose, three cheap layers, all from `time` (no per-frame allocation):
+  //   * breathing  — the torso rises and falls slowly
+  //   * weight     — a slow lateral shift, so a standing avatar is not a statue
+  //   * glance     — an occasional small head turn, on a per-avatar offset so a room
+  //                  full of idle people never moves in lockstep
+  const idle = avatar.moving ? 0 : 1
+  const seed = avatar.blinkSeed ?? 0
+  const reducedMotion = Boolean(options.reducedMotion)
+  const breathing = idle * Math.sin(time * 1.7 + seed * 0.01) * 0.55
+  const weightShift = reducedMotion ? 0 : idle * Math.sin(time * 0.5 + seed * 0.37) * 0.5
+  const glance = reducedMotion ? 0 : idle * Math.sin(time * 0.23 + seed * 0.11) * (Math.sin(time * 0.07 + seed) > 0.6 ? 1 : 0) * 1.1
   const blink = options.blink ?? false
 
   ctx.save()
@@ -530,10 +558,12 @@ export function drawAvatar(ctx, avatar, options = {}) {
 
   drawIndicatorSlots(ctx, avatar, pose, time)
   drawShadow(ctx, pose)
+  if (weightShift !== 0) ctx.translate(weightShift * 0.4, 0)
   drawLegs(ctx, appearance, pose, walkPhase)
   const bob = drawTorso(ctx, appearance, pose) + breathing
   drawArms(ctx, appearance, pose, bob)
-  drawHead(ctx, appearance, pose, bob + breathing * 0.4, time, blink)
+  drawHead(ctx, appearance, pose, bob + breathing * 0.4 + glance, time, blink)
+  if (weightShift !== 0) ctx.translate(-weightShift * 0.4, 0)
 
   // carried bag (procedural detail, drawn last so it hangs over the shoulder)
   if (appearance.hasBag && pose.mode !== 'front') {
@@ -549,6 +579,38 @@ export function drawAvatar(ctx, avatar, options = {}) {
     ctx.restore()
   }
 
+  ctx.restore()
+  return true
+}
+
+/**
+ * Hover and selection feedback, drawn *under* the avatar by the engine so it reads
+ * as a marker on the floor. Selection is deliberately the stronger of the two: a
+ * pointer passes over people all the time, but selecting one is a decision.
+ */
+export function drawAvatarFocus(ctx, avatar, { hovered = false, selected = false, time = 0, reducedMotion = false } = {}) {
+  if (!hovered && !selected) return false
+  ctx.save()
+  ctx.translate(avatar.x, avatar.y)
+
+  const pulse = reducedMotion ? 0 : Math.sin(time * 2.4) * 1.4
+  if (selected) {
+    ctx.strokeStyle = withAlpha(PALETTE.accents.amber, 0.85)
+    ctx.lineWidth = 2.4
+    ctx.setLineDash([9, 6])
+    ctx.lineDashOffset = reducedMotion ? 0 : -((time * 18) % 30)
+    ctx.beginPath()
+    ctx.ellipse(0, 2, 21 + pulse, 10 + pulse * 0.5, 0, 0, Math.PI * 2)
+    ctx.stroke()
+    ctx.setLineDash([])
+  }
+  if (hovered && !selected) {
+    ctx.strokeStyle = 'rgba(210, 232, 255, 0.45)'
+    ctx.lineWidth = 1.6
+    ctx.beginPath()
+    ctx.ellipse(0, 2, 19, 9, 0, 0, Math.PI * 2)
+    ctx.stroke()
+  }
   ctx.restore()
   return true
 }
@@ -575,10 +637,20 @@ export function drawAvatarLabel(ctx, screenPoint, avatar, options = {}) {
 
   const name = avatar.name ?? 'Guest'
   const isLocal = Boolean(avatar.isLocal)
-  const label = isLocal ? `${name} (you)` : name
+  const selected = Boolean(options.selected)
+  const hovered = Boolean(options.hovered)
+  // The hovered/selected avatar gets its distance and the level it is being heard at.
+  // That is the same number the spatial graph is mixing, so the label cannot lie
+  // about what you are hearing.
+  const detail =
+    !isLocal && (selected || hovered) && Number.isFinite(avatar.distance)
+      ? `${Math.round(avatar.distance)} u · ${avatar.volumePercent ?? 0}%`
+      : null
+  const label = detail ? `${isLocal ? `${name} (you)` : name}   ${detail}` : isLocal ? `${name} (you)` : name
 
   ctx.save()
-  ctx.font = '600 11px ui-sans-serif, system-ui, -apple-system, sans-serif'
+  // Emphasis: the selected avatar is bold, the hovered one is slightly brighter.
+  ctx.font = `${selected ? 700 : 600} ${selected || hovered ? 11.5 : 11}px ui-sans-serif, system-ui, -apple-system, sans-serif`
   ctx.textAlign = 'left'
   ctx.textBaseline = 'middle'
 
@@ -602,10 +674,18 @@ export function drawAvatarLabel(ctx, screenPoint, avatar, options = {}) {
   ctx.scale(scale, scale)
 
   roundRectPath(ctx, -width / 2, -height / 2, width, height, 7)
-  ctx.fillStyle = PALETTE.labels.bubble
+  ctx.fillStyle = selected ? PALETTE.labels.bubbleSelected : PALETTE.labels.bubble
   ctx.fill()
-  ctx.strokeStyle = isLocal ? withAlpha(PALETTE.labels.localBadge, 0.85) : PALETTE.labels.bubbleBorder
-  ctx.lineWidth = isLocal ? 1.6 : 1
+  if (selected) {
+    ctx.strokeStyle = withAlpha(PALETTE.accents.amber, 0.9)
+    ctx.lineWidth = 1.8
+  } else if (hovered) {
+    ctx.strokeStyle = 'rgba(214, 232, 255, 0.6)'
+    ctx.lineWidth = 1.4
+  } else {
+    ctx.strokeStyle = isLocal ? withAlpha(PALETTE.labels.localBadge, 0.85) : PALETTE.labels.bubbleBorder
+    ctx.lineWidth = isLocal ? 1.6 : 1
+  }
   ctx.stroke()
 
   // little pointer

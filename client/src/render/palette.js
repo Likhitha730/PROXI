@@ -110,6 +110,8 @@ export const PALETTE = Object.freeze({
     zone: 'rgba(236, 243, 255, 0.5)',
     zoneLetter: 'rgba(236, 243, 255, 0.34)',
     bubble: 'rgba(12, 17, 26, 0.82)',
+    // Warm bubble for the avatar you have selected, matching its amber ring.
+    bubbleSelected: 'rgba(38, 28, 12, 0.88)',
     bubbleBorder: 'rgba(120, 150, 200, 0.35)',
     bubbleText: '#eaf1ff',
     localBadge: '#4f6bd8',

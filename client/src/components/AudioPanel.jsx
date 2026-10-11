@@ -2,6 +2,22 @@ import { useEffect, useState } from 'react'
 import { MIC_STATE } from '../audio/audioEngine.js'
 import { LIMITS } from '../../../shared/protocol.js'
 
+/** Plain-language description of the shared AudioContext, for the panel footer. */
+function contextLabel(context) {
+  switch (context?.state) {
+    case 'running':
+      return context.hasStereoPanner ? 'running · stereo panning on' : 'running · no stereo panning'
+    case 'suspended':
+      return 'suspended — press the microphone button to start it'
+    case 'unavailable':
+      return 'unavailable — audio plays without attenuation'
+    case 'idle':
+      return 'not started yet'
+    default:
+      return context?.state ?? 'unknown'
+  }
+}
+
 /**
  * Audio panel: the microphone control and the state of every voice connection.
  *
@@ -34,6 +50,13 @@ export function AudioPanel({ audio, connection }) {
   const speaking = peers.filter((peer) => peer.speaking && peer.state === 'connected').length
   const connecting = peers.filter((peer) => peer.state === 'connecting').length
   const failed = peers.filter((peer) => peer.state === 'failed')
+  const radius = audio?.listeningRadius ?? LIMITS.PROXIMITY_RADIUS
+  const context = audio?.audioContext ?? null
+  // Peers mixed through the managed Web Audio graph vs. the plain fallback. Shown
+  // because it is the difference between "you are hearing distance" and "you are
+  // hearing a flat stream".
+  const graphStreams = peers.filter((peer) => peer.usesGraph).length
+  const plainStreams = peers.length - graphStreams
 
   function handleMic() {
     if (micActive) {
@@ -117,7 +140,7 @@ export function AudioPanel({ audio, connection }) {
           ? 'No voice connections. Walk within earshot of somebody with their microphone on.'
           : `${peers.length} voice connection${peers.length === 1 ? '' : 's'}` +
             `${speaking > 0 ? ` · ${speaking} speaking` : ''}` +
-            `${connecting > 0 ? ` · ${connecting} connecting` : ''}`) + ` · listening radius ${LIMITS.PROXIMITY_RADIUS} u`}
+            `${connecting > 0 ? ` · ${connecting} connecting` : ''}`) + ` · listening radius ${radius} u`}
       </p>
 
       {peers.length > 0 ? (
@@ -137,6 +160,19 @@ export function AudioPanel({ audio, connection }) {
               />
               <span className="audio__peer-name">{peer.name ?? 'Someone nearby'}</span>
               {peer.muted ? <span className="audio__badge" data-testid={`audio-peer-muted-${peer.id}`}>muted</span> : null}
+              {peer.state === 'connected' ? (
+                <span
+                  className="audio__meter"
+                  data-testid={`audio-peer-level-${peer.id}`}
+                  data-level={peer.volumePercent ?? 0}
+                  title={`distance ${peer.distance ?? '?'} u · heard at ${peer.volumePercent ?? 0}%`}
+                >
+                  <span className="audio__meter-fill" style={{ width: `${peer.volumePercent ?? 0}%` }} aria-hidden="true" />
+                  <span className="audio__meter-text">
+                    {peer.distance ?? '—'} u · {peer.volumePercent ?? 0}%
+                  </span>
+                </span>
+              ) : null}
               <span className="audio__peer-state" data-testid={`audio-peer-state-${peer.id}`}>
                 {peer.state === 'connected'
                   ? peer.speaking
@@ -150,6 +186,27 @@ export function AudioPanel({ audio, connection }) {
           ))}
         </ul>
       ) : null}
+
+      {/*
+        The audio engine, in words. "Distance is a world-unit number" is the one thing
+        a reader of this panel should never have to guess.
+      */}
+      <dl className="kv kv--tight" data-testid="audio-engine">
+        <dt>Audio engine</dt>
+        <dd data-testid="audio-engine-state">
+          {contextLabel(context)}
+          {context?.state === 'running' && context.sampleRate ? ` · ${context.sampleRate} Hz` : ''}
+        </dd>
+        <dt>Distance curve</dt>
+        <dd>linear · full volume to {Math.round(radius / 2)} u, silent at {radius} u (world units)</dd>
+        <dt>Spatial graph</dt>
+        <dd data-testid="audio-engine-graph">
+          {peers.length === 0
+            ? 'no remote streams'
+            : `${graphStreams} of ${peers.length} stream${peers.length === 1 ? '' : 's'} through the spatial graph` +
+              (plainStreams > 0 ? ` · ${plainStreams} plain (no attenuation)` : '')}
+        </dd>
+      </dl>
 
       {failed.length > 0 ? (
         <p className="panel__error" data-testid="audio-failed" role="alert">

@@ -1,7 +1,7 @@
 # ProxiSpeak — System Architecture
 
-**Status:** Design baseline for implementation
-**Last updated:** 2026-10-11
+**Status:** Implemented through Session 7 (spatial audio + 2D polish)
+**Last updated:** 2026-10-12
 
 ## 1. Overview
 
@@ -300,27 +300,44 @@ browsers. Logs contain ids, states, sizes and error names: never SDP bodies, nev
 candidate addresses, never device labels, never sample data. The voice-activity
 detector publishes a single boolean and connects its analyser to nothing.
 
-### 8.6 Deliberately out of scope this session
+### 8.6 Spatial audio
 
-Distance-based volume and stereo panning are **not** implemented: every call plays at
-full volume. Section 9 below describes that graph as it was planned; it is a design
-note for a later session, not a description of the current build.
+Implemented in `client/src/audio/spatialAudio.js` (graph + math) and driven from the
+frame loop by `audioEngine.updateSpatial(frame)`.
 
-## 9. Spatial Audio Graph (Web Audio API) — planned, NOT implemented
+## 9. Spatial Audio Graph (Web Audio API) — implemented
 
-> Status: design note for a later session. The current build attaches remote streams
-> to plain `<audio>` elements at full volume; there is no gain or panning node. See §8.6.
-
-Per remote peer:
+Per remote **stream** (not per peer: a renegotiation creates a new stream and a new
+graph, and the old one is disposed):
 
 ```
 MediaStreamAudioSourceNode → GainNode (distance) → StereoPannerNode → destination
 ```
 
-- `gain = clamp(1 − d / AUDIO_RANGE, 0, 1) ^ 1.5`, updated on each `position:update` (throttled to animation frames).
-- `pan = clamp(relativeX / AUDIO_RANGE, −1, 1)` where `relativeX = peer.x − local.x` (screen-space x).
-- The local mic is NOT routed to speakers (avoids feedback); only remote streams are rendered.
-- `AudioContext` is resumed on the first user gesture (browser autoplay policy).
+- `gain = clamp(1 − distance / listeningRadius, 0, 1)` — documented, linear, evaluated in
+  **world units** from the same interpolated peer positions the renderer draws. The
+  listening radius is `LIMITS.PROXIMITY_RADIUS` (server-configurable), so audio range and
+  proximity range cannot drift apart.
+- `pan = clamp(dx / listeningRadius, −1, 1)` with `dx` the world-space horizontal offset.
+  Applied through a `StereoPannerNode` when the browser has one; without it the stream
+  stays centred rather than failing.
+- Smoothing: a new stream starts at gain 0 and fades in, updates use
+  `AudioParam.setTargetAtTime` (gain τ = 60 ms, pan τ = 80 ms), values that did not move
+  are skipped, and disposal ramps to 0 before disconnecting. No value is ever stepped.
+- Updates come from the **animation frame loop** (`engine.setFrameHook`), which already
+  owns interpolation, so no extra timer, no second position source, and no per-frame
+  allocation (`updateSpatial` writes into one reused object and adopts the renderer's
+  peer objects by reference).
+- **Camera zoom never changes perceived proximity**: only world coordinates enter the
+  curve. Zooming out to see the whole office does not make everyone quieter. (The mouse
+  picking radius *does* scale with zoom, because a click target has to stay comfortable
+  on screen — a pointer concern, not an audio one.)
+- One volume control per stream: the graph's gain. The `<audio>` element fallback (used
+  only when Web Audio is unavailable) carries no attenuation at all, so the two can never
+  fight.
+- The local mic is NOT routed to speakers (avoids feedback); only remote streams are
+  rendered. The `AudioContext` is created lazily and resumed from a user gesture (enabling
+  the microphone); its state is surfaced in the Voice panel.
 
 ## 10. Security Risks
 

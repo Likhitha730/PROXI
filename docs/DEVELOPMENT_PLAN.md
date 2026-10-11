@@ -1,6 +1,6 @@
 # ProxiSpeak — Development Plan
 
-**Last updated:** 2026-10-11
+**Last updated:** 2026-10-12
 **Scope of this session:** documentation only (this file, PROJECT_REQUIREMENTS.md, ARCHITECTURE.md, .gitignore). No application code, no dependency installation.
 
 ## Guiding Rules
@@ -61,23 +61,38 @@ Acceptance criteria: panel updates ≤ 5 Hz; lists exactly the users within rang
 
 ## Phase 5 — WebRTC Audio + Spatial Audio
 
-Status: **voice implemented** (see [SESSION_06_REPORT.md](./SESSION_06_REPORT.md)); the
-spatial-audio half is **not** implemented. The listening radius is 100 units (not the
-450 units this plan originally guessed), with 12 units of hysteresis.
+Status: **fully implemented** — voice in [SESSION_06_REPORT.md](./SESSION_06_REPORT.md),
+the spatial graph and the 2D polish in [SESSION_07_REPORT.md](./SESSION_07_REPORT.md).
+The listening radius is 100 units (not the 450 units this plan originally guessed), with
+12 units of hysteresis.
 
 Implemented: proximity-filtered peer connections, server-authorized signalling relay
 with server-derived sender identity, per-session signalling rate limits, STUN/TURN
 configuration served from `/api/ice`, microphone consent on an explicit user action,
 mute, speaking/connection indicators, and teardown on revocation, hang-up or disconnect.
 
-Not implemented (deliberately deferred): the Web Audio graph — distance gain and stereo
-panning. Every call currently plays at full volume; `docs/ARCHITECTURE.md` §9 is marked
-as a design note for a later session.
+Implemented in Session 7: the managed Web Audio graph per remote stream — distance gain
+`clamp(1 − d / listeningRadius, 0, 1)` in world units, stereo panning where supported,
+`setTargetAtTime` smoothing, fade-in/fade-out around connect and teardown, and a lazily
+created AudioContext resumed from a user gesture. `docs/ARCHITECTURE.md` §9 documents the
+build instead of a plan.
 
 Acceptance criteria met: voice connects only within range; teardown on exit or when the
 listening radius is left; mic denial (and missing device, missing WebRTC) degrades
-gracefully with a clear UI state. Deferred: volume and pan following position, which
-depends on the unimplemented audio graph.
+gracefully with a clear UI state; volume and pan follow position and are monotonic with
+distance (unit tests over the curve + scripted two-client verification).
+
+## Phase 5c — 2D Interaction Polish
+
+Tasks: idle poses and directional animation; ambient motion in plants and office
+details; proximity rings and a smoothed speaking indicator; readable labels with hover
+and selected-avatar feedback; furniture collision boundaries and a stable camera;
+responsive layout; reduced-motion handling.
+
+Acceptance criteria: animation stays independent of React renders; no per-frame
+allocation and no AudioNodes created in the loop; the office reads clearly at 1 to 48
+avatars. Measured in [SESSION_07_REPORT.md](./SESSION_07_REPORT.md) §5
+(`npm run bench:render`).
 
 ## Phase 6 — Persistence, Polish, Verification
 

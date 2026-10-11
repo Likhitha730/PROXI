@@ -11,6 +11,7 @@ import { createFakeCanvas, createFakeContext, installFakeRaf, pressKey, tapKey }
 import { SPAWNS, STATIC_COLLIDERS, WALKABLE_BOUNDS, ZONES } from '../world/worldData.js'
 import { circleHitsAny } from '../world/collision.js'
 import { AVATAR_RADIUS } from '../world/worldData.js'
+import { LIMITS } from '../../../shared/protocol.js'
 
 let raf
 let engine
@@ -750,5 +751,184 @@ describe('proximity ring', () => {
     raf.step(1)
     const ctx = canvas.getContext('2d')
     expect(ctx.getLineDash()).toEqual([])
+  })
+})
+
+describe('interaction: hover, selection and the pickup radius', () => {
+  /** Screen point of the local avatar, for synthesising pointer events. */
+  function screenPointOf(x, y) {
+    const world = engine.getCamera().worldToScreen?.(x, y)
+    return world ?? { x, y }
+  }
+
+  function pointer(type, point, { pointerId = 1, button = 0, moved = 0 } = {}) {
+    const at = point
+    canvas.dispatch(type, {
+      clientX: at.x,
+      clientY: at.y,
+      pointerId,
+      button,
+      buttons: button === 0 ? 1 : 0,
+      moved,
+    })
+  }
+
+  it('hovers the avatar under the pointer and clears it again on leave', () => {
+    startEngine()
+    raf.step(1)
+    const self = engine.getPlayer()
+
+    pointer('pointermove', screenPointOf(self.x, self.y))
+    expect(store.getSnapshot().hoveredId).toBe(self.id)
+    expect(canvas.style.cursor).toBe('pointer')
+
+    pointer('pointerleave', screenPointOf(3000, 3000))
+    expect(store.getSnapshot().hoveredId).toBeNull()
+    expect(canvas.style.cursor).toBe('')
+  })
+
+  it('selects on a click and clears the selection on empty floor', () => {
+    startEngine()
+    raf.step(1)
+    const self = engine.getPlayer()
+    const at = screenPointOf(self.x, self.y)
+
+    pointer('pointerdown', at)
+    pointer('pointerup', at)
+    expect(store.getSnapshot().selectedId).toBe(self.id)
+    expect(store.getSnapshot().selected).toMatchObject({ id: self.id, isLocal: true })
+
+    const empty = screenPointOf(self.x + 600, self.y + 400)
+    pointer('pointerdown', empty)
+    pointer('pointerup', empty)
+    expect(store.getSnapshot().selectedId).toBeNull()
+    expect(store.getSnapshot().selected).toBeNull()
+  })
+
+  it('selects through the public API and describes the avatar it points at', () => {
+    startEngine()
+    engine.setPeers([
+      { id: 'p1', name: 'Ada', x: 900, y: 800, nearby: true, distance: 42, volumePercent: 58, speaking: true },
+    ])
+    raf.step(1)
+
+    engine.select('p1')
+    expect(store.getSnapshot().selected).toEqual({
+      id: 'p1',
+      name: 'Ada',
+      isLocal: false,
+      distance: 42,
+      volumePercent: 58,
+      speaking: true,
+      muted: false,
+      nearby: true,
+    })
+
+    engine.clearSelection()
+    expect(store.getSnapshot().selected).toBeNull()
+    // A selection the world no longer contains must not linger.
+    engine.select('ghost')
+    expect(store.getSnapshot().selected).toBeNull()
+  })
+
+  it('treats a drag as a camera pan, not as a selection', () => {
+    startEngine()
+    raf.step(1)
+    const self = engine.getPlayer()
+    const start = screenPointOf(self.x, self.y)
+    const zoomBefore = engine.getCamera().zoom
+
+    pointer('pointerdown', start)
+    pointer('pointermove', { x: start.x + 40, y: start.y + 10 })
+    pointer('pointerup', { x: start.x + 40, y: start.y + 10 })
+
+    expect(store.getSnapshot().selectedId).toBeNull()
+    expect(engine.getCamera().follow).toBe(false)
+    expect(engine.getCamera().zoom).toBe(zoomBefore)
+  })
+})
+
+describe('audio frame hook (world coordinates, never screen pixels)', () => {
+  const frames = []
+
+  function captureFrames() {
+    frames.length = 0
+    engine.setFrameHook((frame) => frames.push(frame))
+    return frames
+  }
+
+  it('calls the hook once per frame with the reusable frame object', () => {
+    startEngine()
+    const seen = captureFrames()
+    raf.step(5)
+
+    expect(seen).toHaveLength(5)
+    expect(new Set(seen).size).toBe(1) // one object, refilled — nothing allocated per frame
+    expect(typeof seen[0].dt).toBe('number')
+    expect(seen[0].dt).toBeGreaterThan(0)
+    expect(Number.isFinite(seen[0].elapsed)).toBe(true)
+  })
+
+  it('carries world coordinates and the world-space listening radius', () => {
+    startEngine()
+    engine.setPeers([{ id: 'p1', name: 'Ada', x: 1234, y: 987, nearby: true }])
+    const seen = captureFrames()
+    raf.step(2)
+
+    const frame = seen[0]
+    const self = engine.getPlayer()
+    expect(frame.player.x).toBeCloseTo(self.x, 6)
+    expect(frame.player.y).toBeCloseTo(self.y, 6)
+    expect(frame.radius).toBe(LIMITS.PROXIMITY_RADIUS)
+    expect(frame.peers[0]).toMatchObject({ id: 'p1', x: 1234, y: 987 })
+    // The camera is not part of this frame: the audio graph must not be able to see it.
+    expect(frame.zoom).toBeUndefined()
+  })
+
+  it('does not change what the audio graph reads when the camera zooms', () => {
+    startEngine()
+    engine.setPeers([{ id: 'p1', name: 'Ada', x: 1234, y: 987, nearby: true }])
+    const seen = captureFrames()
+
+    raf.step(2)
+    const before = { ...seen[0], player: { ...seen[0].player }, peers: seen[0].peers.map((peer) => ({ ...peer })) }
+
+    engine.zoomIn()
+    engine.zoomIn()
+    engine.zoomOut()
+    raf.step(2)
+    const after = seen[2]
+
+    expect(engine.getCamera().zoom).not.toBe(1)
+    // Distance attenuation is computed from these numbers, so they must not move.
+    expect(after.radius).toBe(before.radius)
+    expect(after.player.x).toBeCloseTo(before.player.x, 6)
+    expect(after.player.y).toBeCloseTo(before.player.y, 6)
+    expect(after.peers[0].x).toBe(before.peers[0].x)
+    expect(after.peers[0].y).toBe(before.peers[0].y)
+  })
+
+  it('drives ambient motion and voice easing from the loop, not from React', () => {
+    startEngine()
+    const seen = captureFrames()
+    engine.setLocalVoice({ speaking: true, muted: false })
+    raf.step(3)
+
+    expect(seen.every((frame) => frame.reducedMotion === false)).toBe(true)
+    // The preference can change while the app runs (the system setting is live).
+    engine.setReducedMotion(true)
+    raf.step(1)
+    expect(seen.at(-1).reducedMotion).toBe(true)
+  })
+
+  it('stops calling the hook after destroy', () => {
+    startEngine()
+    const seen = captureFrames()
+    raf.step(2)
+    engine.destroy()
+    engine = null
+    raf.step(2)
+
+    expect(seen).toHaveLength(2)
   })
 })

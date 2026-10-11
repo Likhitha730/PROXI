@@ -17,9 +17,10 @@
 
 import { Camera } from './camera.js'
 import * as world from './worldRenderer.js'
-import { drawFurnitureItem } from './furniture.js'
+import { drawFurnitureItem, setAmbientMotion } from './furniture.js'
 import { LIMITS } from '../../../shared/protocol.js'
-import { blinkState, drawAvatar, drawAvatarLabel } from './avatarRenderer.js'
+import { blinkState, drawAvatar, drawAvatarFocus, drawAvatarLabel } from './avatarRenderer.js'
+import { createMotionPreference, pickAvatar, smoothTowards } from './interaction.js'
 import { createLocalAppearance } from './avatarAppearance.js'
 import { createKeyboardInput } from '../input/keyboard.js'
 import {
@@ -134,6 +135,30 @@ export function createWorldEngine(options) {
   let hudTimer = 0
   let showLabels = true
   let dragPointer = null
+
+  // --- interaction -----------------------------------------------------------
+  /** The avatar under the pointer and the one the user selected, by player id. */
+  let hoveredId = null
+  let selectedId = null
+  const motion = createMotionPreference()
+  let reducedMotion = motion.reduced
+
+  /**
+   * The per-frame hook for systems that must run inside the animation loop but must
+   * not re-render React: currently the spatial audio graph. The object handed over is
+   * reused every frame, so nothing allocates here.
+   */
+  let frameHook = null
+  /**
+   * The frame handed to `setFrameHook` every frame (spatial audio today).
+   *
+   * `peers` is a plain array of the *live* peer objects — refilled in place, so it is
+   * both iterable by the audio graph and allocation-free. It is deliberately NOT the
+   * `peers` Map: an iterable of `[key, value]` pairs would silently make every distance
+   * lookup miss.
+   */
+  const framePeers = []
+  const frameInfo = { player, peers: framePeers, radius: LIMITS.PROXIMITY_RADIUS, dt: 0, elapsed: 0, reducedMotion: false }
 
   // Network integration (see docs/ARCHITECTURE.md §6). All three are plain
   // callbacks so the engine stays network-agnostic and unit-testable:
@@ -263,6 +288,7 @@ export function createWorldEngine(options) {
         drawAvatar(ctx, entry.avatar, {
           time: elapsed,
           blink: blinkState(entry.avatar.blinkSeed ?? 0, elapsed),
+          reducedMotion,
         })
       }
     }
@@ -274,6 +300,26 @@ export function createWorldEngine(options) {
    * as something on the floor. Remote players inside it also get a halo, so the
    * ring and the "nearby" list can never disagree about who is in range.
    */
+  /**
+   * Pre-built colours for the proximity ring and halos.
+   *
+   * These were `rgba(...)` template strings built per frame; at 60 fps with a few
+   * peers that is hundreds of throwaway strings a second inside the hot loop. The
+   * bands are quantised once, at module level, so the frame loop only reads them.
+   */
+  const STRENGTH_BANDS = 12
+  const HALO_FILL = []
+  const HALO_STROKE = []
+  for (let index = 0; index < STRENGTH_BANDS; index += 1) {
+    const strength = index / (STRENGTH_BANDS - 1)
+    HALO_FILL.push(`rgba(126, 224, 255, ${(0.10 + strength * 0.16).toFixed(3)})`)
+    HALO_STROKE.push(`rgba(170, 245, 255, ${(0.25 + strength * 0.45).toFixed(3)})`)
+  }
+  const bandIndex = (strength) => {
+    const index = Math.round(Math.max(0, Math.min(1, strength)) * (STRENGTH_BANDS - 1))
+    return index
+  }
+
   function drawProximityRing() {
     const reported = proximitySource?.()
     const rawRadius = Number(reported?.radius)
@@ -301,22 +347,30 @@ export function createWorldEngine(options) {
     ctx.strokeStyle = 'rgba(160, 240, 255, 0.55)'
     ctx.lineWidth = 2.5
     ctx.setLineDash([14, 10])
-    ctx.lineDashOffset = -((elapsed * 12) % 24)
+    // The dashes march to show the boundary is live — decorative, so they hold still
+    // when the user prefers reduced motion.
+    ctx.lineDashOffset = reducedMotion ? 0 : -((elapsed * 12) % 24)
     ctx.beginPath()
     ctx.arc(player.x, player.y, radius, 0, Math.PI * 2)
     ctx.stroke()
     ctx.setLineDash([])
 
     // Halo under every nearby remote player: the visual counterpart of the list.
+    // The halo follows the same strength band as the audio graph's attenuation
+    // (1 − distance/radius), so what you see and what you hear stay in step. Its
+    // strength is eased (`nearbyLevel`), so walking across the boundary fades rather
+    // than pops.
     for (const peer of peers.values()) {
       if (!peer.nearby) continue
       const distance = Math.hypot(peer.x - player.x, peer.y - player.y)
       const strength = Math.max(0.12, 1 - distance / radius)
-      ctx.fillStyle = `rgba(126, 224, 255, ${(0.10 + strength * 0.16).toFixed(3)})`
+      const eased = peer.nearbyLevel === undefined ? strength : Math.max(0.12, strength * peer.nearbyLevel)
+      const band = bandIndex(eased)
+      ctx.fillStyle = HALO_FILL[band]
       ctx.beginPath()
       ctx.arc(peer.x, peer.y, AVATAR_RADIUS + 10, 0, Math.PI * 2)
       ctx.fill()
-      ctx.strokeStyle = `rgba(170, 245, 255, ${(0.25 + strength * 0.45).toFixed(3)})`
+      ctx.strokeStyle = HALO_STROKE[band]
       ctx.lineWidth = 2
       ctx.beginPath()
       ctx.arc(peer.x, peer.y, AVATAR_RADIUS + 7, 0, Math.PI * 2)
@@ -324,6 +378,30 @@ export function createWorldEngine(options) {
     }
 
     ctx.restore()
+  }
+
+  /**
+   * Hover/selection markers, drawn just above the floor (under wall art, which hangs
+   * on walls) so they read as something you put on the ground next to an avatar.
+   */
+  /** Reused by drawFocusRings: one object for the whole run, not one per avatar. */
+  const focusOptions = { time: 0, reducedMotion: false, hovered: false, selected: false }
+
+  function drawFocusRings() {
+    if (hoveredId === null && selectedId === null) return
+    focusOptions.time = elapsed
+    focusOptions.reducedMotion = reducedMotion
+    if (selectedId === player.id || hoveredId === player.id) {
+      focusOptions.hovered = hoveredId === player.id
+      focusOptions.selected = selectedId === player.id
+      drawAvatarFocus(ctx, player, focusOptions)
+    }
+    for (const peer of peers.values()) {
+      if (peer.id !== hoveredId && peer.id !== selectedId) continue
+      focusOptions.hovered = peer.id === hoveredId
+      focusOptions.selected = peer.id === selectedId
+      drawAvatarFocus(ctx, peer, focusOptions)
+    }
   }
 
   function drawNames() {
@@ -334,6 +412,8 @@ export function createWorldEngine(options) {
       drawAvatarLabel(ctx, camera.worldToScreen(avatar.x, avatar.y), avatar, {
         zoom: camera.zoom,
         showNames: showLabels,
+        hovered: avatar.id === hoveredId,
+        selected: avatar.id === selectedId,
       })
     }
     label(player)
@@ -355,6 +435,7 @@ export function createWorldEngine(options) {
     world.drawLightPools(ctx, camera)
     drawProximityRing()
     drawSceneDepth()
+    drawFocusRings()
     world.drawWallArt(ctx, camera)
     ctx.restore()
 
@@ -369,6 +450,27 @@ export function createWorldEngine(options) {
   function proximityRadius() {
     const raw = Number(proximitySource?.()?.radius)
     return Number.isFinite(raw) && raw > 0 ? raw : DEFAULT_PROXIMITY_RADIUS
+  }
+
+  /**
+   * The selected avatar, as the HUD needs it: name, whether it is you, world-space
+   * distance and the level the spatial graph is mixing it at (stamped onto peers by
+   * the audio engine, so the card and your ears agree).
+   */
+  function describeSelection() {
+    if (!selectedId) return null
+    const avatar = selectedId === player.id ? player : peers.get(selectedId)
+    if (!avatar) return null
+    return Object.freeze({
+      id: avatar.id,
+      name: avatar.name ?? 'Guest',
+      isLocal: Boolean(avatar.isLocal),
+      distance: Number.isFinite(avatar.distance) ? Math.round(avatar.distance) : null,
+      volumePercent: Number.isFinite(avatar.volumePercent) ? avatar.volumePercent : null,
+      speaking: Boolean(avatar.speaking),
+      muted: Boolean(avatar.muted),
+      nearby: Boolean(avatar.nearby),
+    })
   }
 
   function syncHud(force = false) {
@@ -389,6 +491,10 @@ export function createWorldEngine(options) {
         speed: Math.round(player.speed),
       }),
       zoneName: zone ? zone.name : 'Corridor',
+      hoveredId,
+      selectedId,
+      selected: describeSelection(),
+      reducedMotion,
       zoom: Number(camera.zoom.toFixed(2)),
       follow: camera.follow,
       showLabels,
@@ -417,9 +523,25 @@ export function createWorldEngine(options) {
     }
     if (peerProvider) syncPeersFromProvider(peerProvider(timestamp))
     advancePeerWalk(dtSeconds)
+    // Decorative motion (plant sway, light pools, dashed rings) comes from here, and
+    // it stops dead under `prefers-reduced-motion`.
+    setAmbientMotion(elapsed, !reducedMotion)
+    easeVoiceLevels(dtSeconds)
     publishState(dtSeconds)
     camera.update(dtSeconds)
     render()
+
+    // Spatial audio runs inside the animation loop — never per React render — and is
+    // handed the reused `frameInfo` object: same references every frame, no garbage.
+    if (frameHook) {
+      framePeers.length = 0
+      for (const peer of peers.values()) framePeers.push(peer)
+      frameInfo.radius = proximityRadius()
+      frameInfo.dt = dtSeconds
+      frameInfo.elapsed = elapsed
+      frameInfo.reducedMotion = reducedMotion
+      frameHook(frameInfo)
+    }
 
     if (fpsWindowStart === 0) fpsWindowStart = timestamp
     if (timestamp - fpsWindowStart >= 500) {
@@ -572,29 +694,94 @@ export function createWorldEngine(options) {
     syncHud()
   }
 
+  /** Pointer position in world coordinates — the only frame picking is allowed in. */
+  function pointerWorld(event) {
+    const rect = canvas.getBoundingClientRect?.() ?? { left: 0, top: 0 }
+    return camera.screenToWorld(event.clientX - rect.left, event.clientY - rect.top)
+  }
+
+  /**
+   * Hit radius for picking. It is expressed in world units, but scaled by 1/zoom so
+   * the *screen* target stays a comfortable size when zoomed out — picking is a
+   * pointer concern, and the camera is allowed to affect it. (Audio attenuation is
+   * the opposite: world units only, never the camera.)
+   */
+  function pickRadius() {
+    return Math.max(18, 22 / Math.max(camera.zoom, 0.35))
+  }
+
+  function avatarAt(event) {
+    const world = pointerWorld(event)
+    const hit = pickAvatar(world, [...peers.values()], { worldRadius: pickRadius() })
+    if (hit) return hit
+    return pickAvatar(world, [player], { worldRadius: pickRadius() })
+  }
+
+  function updateHover(event) {
+    const hit = avatarAt(event)
+    const nextId = hit?.id ?? null
+    if (nextId === hoveredId) return false
+    hoveredId = nextId
+    if (canvas.style) canvas.style.cursor = nextId ? 'pointer' : ''
+    syncHud()
+    return true
+  }
+
   function handlePointerDown(event) {
     container?.focus?.({ preventScroll: true })
     if (event.button !== 0) return
-    dragPointer = { id: event.pointerId, x: event.clientX, y: event.clientY }
+    dragPointer = { id: event.pointerId, x: event.clientX, y: event.clientY, moved: 0 }
     canvas.setPointerCapture?.(event.pointerId)
   }
 
   function handlePointerMove(event) {
-    if (!dragPointer || event.pointerId !== dragPointer.id) return
-    const dx = event.clientX - dragPointer.x
-    const dy = event.clientY - dragPointer.y
-    if (dx === 0 && dy === 0) return
-    dragPointer.x = event.clientX
-    dragPointer.y = event.clientY
-    camera.panBy(dx, dy)
-    syncHud()
+    if (dragPointer && event.pointerId === dragPointer.id) {
+      const dx = event.clientX - dragPointer.x
+      const dy = event.clientY - dragPointer.y
+      if (dx === 0 && dy === 0) return
+      dragPointer.x = event.clientX
+      dragPointer.y = event.clientY
+      dragPointer.moved += Math.abs(dx) + Math.abs(dy)
+      camera.panBy(dx, dy)
+      syncHud()
+      // Panning and hovering at the same time would fight over the cursor.
+      if (hoveredId !== null) {
+        hoveredId = null
+        if (canvas.style) canvas.style.cursor = ''
+      }
+      return
+    }
+
+    updateHover(event)
   }
 
   function handlePointerUp(event) {
     if (!dragPointer || event.pointerId !== dragPointer.id) return
     canvas.releasePointerCapture?.(event.pointerId)
+    // A press that did not travel is a click, not a pan: select whatever was under
+    // it, or clear the selection when the click landed on empty floor.
+    if (dragPointer.moved < 6) {
+      const hit = avatarAt(event)
+      setSelected(hit?.id ?? null)
+    }
     dragPointer = null
+    updateHover(event)
+  }
+
+  function handlePointerLeave() {
+    if (hoveredId === null) return
+    hoveredId = null
+    if (canvas.style) canvas.style.cursor = ''
     syncHud()
+  }
+
+  /** Select an avatar by id (null clears). Selection drives the HUD card and label. */
+  function setSelected(id) {
+    const next = id ?? null
+    if (next === selectedId) return selectedId
+    selectedId = next
+    syncHud()
+    return selectedId
   }
 
   function handleDoubleClick() {
@@ -623,6 +810,12 @@ export function createWorldEngine(options) {
     canvas.addEventListener?.('pointermove', handlePointerMove)
     canvas.addEventListener?.('pointerup', handlePointerUp)
     canvas.addEventListener?.('pointercancel', handlePointerUp)
+    canvas.addEventListener?.('pointerleave', handlePointerLeave)
+    // Follow the OS preference live: flipping it takes effect on the next frame.
+    motion.subscribe((reduced) => {
+      reducedMotion = reduced
+      syncHud()
+    })
     canvas.addEventListener?.('dblclick', handleDoubleClick)
 
     if (typeof ResizeObserver === 'function') {
@@ -647,6 +840,8 @@ export function createWorldEngine(options) {
     keyboard.detach()
 
     canvas.removeEventListener?.('wheel', handleWheel)
+    motion.dispose()
+    canvas.removeEventListener?.('pointerleave', handlePointerLeave)
     canvas.removeEventListener?.('pointerdown', handlePointerDown)
     canvas.removeEventListener?.('pointermove', handlePointerMove)
     canvas.removeEventListener?.('pointerup', handlePointerUp)
@@ -681,6 +876,9 @@ export function createWorldEngine(options) {
       muted: Boolean(peer.muted),
       nearby: Boolean(peer.nearby),
       distance: peer.distance,
+      // The level the spatial graph is mixing this peer at, stamped by the audio
+      // engine. Carried through so the HUD card can show the number a listener hears.
+      volumePercent: peer.volumePercent,
       blinkSeed: peer.blinkSeed ?? hashString(String(peer.id)),
     }
   }
@@ -738,10 +936,28 @@ export function createWorldEngine(options) {
       if (remote.muted !== undefined) existing.muted = Boolean(remote.muted)
       if (remote.nearby !== undefined) existing.nearby = Boolean(remote.nearby)
       if (remote.distance !== undefined) existing.distance = remote.distance
+      if (remote.volumePercent !== undefined) existing.volumePercent = remote.volumePercent
       if (remote.stale !== undefined) existing.stale = Boolean(remote.stale)
     }
     for (const id of [...peers.keys()]) {
       if (!seen.has(id)) peers.delete(id)
+    }
+  }
+
+  /**
+   * Ease the *visual* voice indicators.
+   *
+   * `speaking` is a boolean that flips between syllables; the level is what the ring
+   * actually draws, so it swells in quickly and settles out slowly instead of
+   * strobing. `nearbyLevel` does the same for the proximity halo, so crossing the
+   * radius boundary fades rather than pops. Both are plain numbers on objects that
+   * already exist — no allocation, no React.
+   */
+  function easeVoiceLevels(dt) {
+    player.speakingLevel = smoothTowards(player.speakingLevel ?? 0, player.speaking ? 1 : 0, dt, { attack: 12, release: 4 })
+    for (const peer of peers.values()) {
+      peer.speakingLevel = smoothTowards(peer.speakingLevel ?? 0, peer.speaking ? 1 : 0, dt, { attack: 12, release: 4 })
+      peer.nearbyLevel = smoothTowards(peer.nearbyLevel ?? 0, peer.nearby ? 1 : 0, dt, { attack: 5, release: 2.5 })
     }
   }
 
@@ -771,6 +987,33 @@ export function createWorldEngine(options) {
     setStateReporter(reporter) {
       stateReporter = typeof reporter === 'function' ? reporter : null
       return stateReporter !== null
+    },
+    /**
+     * Register the per-frame hook (spatial audio). It receives ONE reused object:
+     * `{ player, peers, radius, dt, elapsed, reducedMotion }`. Do not retain it, and
+     * do not allocate in it — it runs 60 times a second.
+     */
+    setFrameHook(hook) {
+      frameHook = typeof hook === 'function' ? hook : null
+      return frameHook !== null
+    },
+    /** Local voice state, so the local avatar shows the same indicators as peers. */
+    setLocalVoice({ speaking, muted } = {}) {
+      if (speaking !== undefined) player.speaking = Boolean(speaking)
+      if (muted !== undefined) player.muted = Boolean(muted)
+      return { speaking: player.speaking, muted: player.muted }
+    },
+    /** Programmatic equivalent of clicking an avatar (also used by tests). */
+    select(id) {
+      return setSelected(id)
+    },
+    clearSelection() {
+      return setSelected(null)
+    },
+    setReducedMotion(enabled) {
+      reducedMotion = Boolean(enabled)
+      syncHud()
+      return reducedMotion
     },
     /** Network layer hook: returns `{ radius }` for the ring (see presence.getProximity). */
     setProximitySource(source) {
@@ -822,6 +1065,11 @@ export function createWorldEngine(options) {
       showLabels,
       spawnId: spawn.id,
       peers: peers.size,
+      hoveredId,
+      selectedId,
+      reducedMotion,
+      motionPreferenceSupported: motion.supported,
+      hasFrameHook: frameHook !== null,
       hasPeerProvider: peerProvider !== null,
       hasStateReporter: stateReporter !== null,
       reportedMoves,
