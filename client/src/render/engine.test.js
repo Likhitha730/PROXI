@@ -500,3 +500,167 @@ describe('peers (network-ready rendering path)', () => {
     expect(store.getSnapshot().peerCount).toBe(0)
   })
 })
+
+describe('network integration hooks', () => {
+  /** A remote player as the presence module hands it over, mutated in place. */
+  function remotePlayer(overrides = {}) {
+    return {
+      id: 'peer-1',
+      name: 'Ada',
+      x: 900,
+      y: 800,
+      facing: 0,
+      moving: true,
+      speaking: false,
+      muted: false,
+      nearby: false,
+      stale: false,
+      ...overrides,
+    }
+  }
+
+  it('is inert without a network layer (no provider, no reporter)', () => {
+    startEngine()
+    raf.step(10)
+    const diagnostics = engine.getDiagnostics()
+    expect(diagnostics.hasPeerProvider).toBe(false)
+    expect(diagnostics.hasStateReporter).toBe(false)
+    expect(diagnostics.reportedMoves).toBe(0)
+    expect(engine.getPeers()).toEqual([])
+  })
+
+  it('reconciles remote players from the provider on every frame', () => {
+    startEngine()
+    raf.step(1)
+
+    const list = [remotePlayer()]
+    let providerCalls = 0
+    engine.setPeerProvider(() => {
+      providerCalls += 1
+      return list
+    })
+
+    raf.step(3)
+    expect(providerCalls).toBe(3)
+    expect(engine.getPeers()).toHaveLength(1)
+
+    // a second player appears
+    list.push(remotePlayer({ id: 'peer-2', name: 'Grace', x: 1000, y: 900 }))
+    raf.step(1)
+    expect(engine.getPeers().map((peer) => peer.name).sort()).toEqual(['Ada', 'Grace'])
+
+    // the first walks; the engine follows the mutated object
+    list[0].x = 940
+    list[0].y = 810
+    raf.step(1)
+    const ada = engine.getPeers().find((peer) => peer.id === 'peer-1')
+    expect(ada).toMatchObject({ x: 940, y: 810 })
+    expect(ada.walkPhase).not.toBe(0) // the walk cycle advanced with real travel
+
+    // and a leave removes it
+    list.shift()
+    raf.step(1)
+    expect(engine.getPeers().map((peer) => peer.id)).toEqual(['peer-2'])
+
+    // HUD sees the count through the store (still throttled, not per frame)
+    const lastWrite = store.writes.at(-1)
+    expect(lastWrite.peerCount === undefined || typeof lastWrite.peerCount === 'number').toBe(true)
+  })
+
+  it('gives remote avatars an appearance and a blink seed it keeps across frames', () => {
+    startEngine()
+    const list = [remotePlayer()]
+    engine.setPeerProvider(() => list)
+    raf.step(1)
+    const first = engine.getPeers()[0]
+    const appearance = first.appearance
+    const blinkSeed = first.blinkSeed
+
+    raf.step(30)
+    const later = engine.getPeers()[0]
+    expect(later.appearance).toBe(appearance) // same object, not rebuilt per frame
+    expect(later.blinkSeed).toBe(blinkSeed)
+  })
+
+  it('publishes local movement at most 15 times per second', () => {
+    startEngine()
+    const reports = []
+    engine.setStateReporter((state) => reports.push(state))
+
+    // 120 frames at 16 ms = 1.92 s of simulated time, walking the whole way.
+    holdKeys('KeyD')
+    raf.step(120)
+    releaseKeys('KeyD')
+
+    expect(reports.length).toBeGreaterThan(0)
+    expect(reports.length).toBeLessThanOrEqual(30) // ~15 Hz, never per frame
+    for (const report of reports) {
+      expect(Number.isFinite(report.x)).toBe(true)
+      expect(Number.isFinite(report.y)).toBe(true)
+      expect(Number.isFinite(report.dir)).toBe(true)
+      expect(typeof report.moving).toBe('boolean')
+    }
+    // rounded to centimetre precision, which is all the wire needs
+    expect(reports.at(-1).x).toBe(Math.round(reports.at(-1).x * 100) / 100)
+    expect(engine.getDiagnostics().reportedMoves).toBe(reports.length)
+  })
+
+  it('stays quiet while idle instead of streaming unchanged positions', () => {
+    startEngine()
+    const reports = []
+    engine.setStateReporter((state) => reports.push(state))
+    raf.step(60) // 0.96 s standing still
+
+    expect(reports.length).toBeLessThanOrEqual(1) // no movement, no traffic
+    expect(engine.getDiagnostics().reportedMoves).toBeLessThanOrEqual(1)
+  })
+
+  it('snaps to the authoritative position the server sends back', () => {
+    startEngine()
+    raf.step(1)
+    engine.getPlayer().x = 1280
+    engine.getPlayer().y = 1500
+
+    const corrections = [{ x: 1180, y: 1420 }]
+    engine.setCorrectionSource(() => corrections.pop() ?? null)
+    raf.step(1)
+
+    const player = engine.getPlayer()
+    expect(player.x).toBe(1180)
+    expect(player.y).toBe(1420)
+    expect(player.vx).toBe(0)
+    expect(player.vy).toBe(0)
+
+    // drained once: the next frame must not re-apply it
+    player.x = 1190
+    raf.step(1)
+    expect(engine.getPlayer().x).toBe(1190)
+  })
+
+  it('ignores a nonsensical correction instead of teleporting the avatar', () => {
+    startEngine()
+    raf.step(1)
+    const before = { x: engine.getPlayer().x, y: engine.getPlayer().y }
+    engine.setCorrectionSource(() => ({ x: Number.NaN, y: 12 }))
+    raf.step(2)
+    expect(engine.getPlayer()).toMatchObject(before)
+  })
+
+  it('accepts a rename from the network layer', () => {
+    startEngine()
+    expect(engine.setPlayerName('Ada Lovelace')).toBe('Ada Lovelace')
+    expect(engine.getPlayer().name).toBe('Ada Lovelace')
+    expect(engine.setPlayerName('   ')).toBe('Ada Lovelace')
+  })
+
+  it('drops peers when the engine is destroyed', () => {
+    startEngine()
+    engine.setPeerProvider(() => [remotePlayer()])
+    raf.step(1)
+    expect(engine.getPeers()).toHaveLength(1)
+
+    engine.destroy()
+    expect(engine.getPeers()).toEqual([])
+    engine = null
+  })
+})

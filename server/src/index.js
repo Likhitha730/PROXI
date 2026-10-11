@@ -12,6 +12,7 @@ import { createApp } from './app.js'
 import { config as defaultConfig, createOriginValidator } from './config/env.js'
 import { createLogger } from './lib/logger.js'
 import { registerSocketHandlers } from './sockets/handlers.js'
+import { createPlayerRegistry } from './realtime/registry.js'
 import { closeDatabase, connectDatabase } from './db/mongo.js'
 
 /** Builds the app, HTTP server and Socket.IO instance without listening. */
@@ -34,9 +35,12 @@ export function createServer({ config = defaultConfig, logger = createLogger({ l
     maxHttpBufferSize: 100_000,
   })
 
-  registerSocketHandlers(io, { logger, config })
+  // One registry per server instance, owned here so tests and future services
+  // (proximity, persistence) can inspect the same authoritative presence table.
+  const registry = createPlayerRegistry()
+  const realtime = registerSocketHandlers(io, { logger, config, registry })
 
-  return { app, httpServer, io, logger, config }
+  return { app, httpServer, io, logger, config, registry, realtime }
 }
 
 function closeHttpServer(server) {

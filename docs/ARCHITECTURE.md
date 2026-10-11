@@ -41,16 +41,20 @@ ProxiSpeak/
 │   │   ├── index.js            # Express + Socket.IO bootstrap
 │   │   ├── config/env.js       # env access with defaults and validation
 │   │   ├── db/mongo.js         # official driver connect + index setup
-│   │   ├── sockets/handlers.js # socket event routing
-│   │   ├── services/presence.js
-│   │   ├── services/proximity.js
-│   │   └── services/validation.js
+│   │   ├── sockets/handlers.js     # presence protocol (join/move/disconnect)
+│   │   ├── realtime/registry.js    # authoritative player table
+│   │   ├── realtime/rateLimiter.js # token bucket for movement updates
+│   │   └── db/mongo.js             # persistence (not enabled yet)
 │   └── package.json
+├── shared/
+│   └── protocol.js             # ONE wire contract imported by client AND server
 ├── .env.example
 └── .gitignore
 ```
 
-Rule: `world/`, `render/`, and `services/` are pure and unit-testable; `net/` (client) and `sockets/` (server) are the only I/O boundaries.
+Rule: `world/`, `render/`, `realtime/`, and `shared/` are pure and unit-testable;
+`net/` (client) and `sockets/` (server) are the only I/O boundaries. Proximity and
+signalling services land in `server/src/realtime/` in a later session.
 
 ## 3. World Model and Coordinate System
 
@@ -79,44 +83,60 @@ Rule: `world/`, `render/`, and `services/` are pure and unit-testable; `net/` (c
 
 ### 4.3 Network Client
 
-- Socket.IO wrapper (`net/socketClient.js`): connect, reconnect handling, event dispatch into the store, outbound throttling (position updates at 15 Hz).
-- Connection states: `connecting → connected → disconnected`, exposed to the UI; Socket.IO default auto-reconnect with backoff; roster resync on reconnect.
+- Socket.IO wrapper (`net/socketClient.js`): connect, reconnect handling, protocol wiring (join on connect, presence events in, movement out at ≤ 15 Hz). Listener binding is idempotent — a StrictMode remount or a reconnect can never double-subscribe.
+- Connection states: `connecting → connected → disconnected → error`, exposed to the UI; Socket.IO auto-reconnect with backoff; a reconnect is a new server session, so the client clears stale presence and re-joins with its stored display name.
+- Presence model (`net/presence.js`): owns remote players and separates two consumers — the canvas engine (interpolated positions, read every frame, no allocation) and the React HUD (a frozen snapshot that changes only on join/leave/rename/session events, **never** on movement).
+- Remote motion (`render/interpolation.js`): samples are buffered and rendered `INTERPOLATION_DELAY_MS` (120 ms) in the past, interpolated between the bracketing samples, with bounded extrapolation (`EXTRAPOLATION_LIMIT_MS` 150 ms) when the stream stalls.
 
 ## 5. Backend Architecture
 
 - Express: health endpoint, static serving of `client/dist` in production, CORS (origin from env).
 - Socket.IO: `path: /socket.io`, transports `["websocket", "polling"]`, CORS same-origin policy as Express.
-- In-memory authoritative state: `Map<userId, { id, name, x, y, dir, moving, lastSeen, socketId }>`.
-- Presence service: join/leave, roster broadcast, disconnect cleanup (single `disconnect` handler; no duplicate listeners).
+- In-memory authoritative state (`server/src/realtime/registry.js`): `Map<socketId, { player, socketId, lastPosition }>`. The player record is `{ id, name, x, y, dir, moving, joinedAt }`, frozen on write; `id` is a server-minted UUID — a client can never choose or reuse one.
+- Presence service (`server/src/sockets/handlers.js`): join/rename/snapshot, roster broadcast, movement relay, disconnect cleanup (one `disconnect` handler per socket; listeners registered exactly once per connection). Identity and room membership are server-owned: any `id`/`room` field a client sends inside `player:join` is ignored.
+- One socket can never create two players: a second `player:join` with a different name is a *rename* (same id, re-announced as an upsert); with the same name it is a no-op. The room is a single server-assigned lobby, capped at `MAX_PLAYERS_PER_ROOM` (24).
+- Validation service (`shared/protocol.js`, used authoritatively by `server/src/sockets/handlers.js`): finite numbers, walkable-world bounds, max displacement per update (anti-teleport), name length/charset, `clientTs` skew. Rate limiting (`server/src/realtime/rateLimiter.js`) is a token bucket: `MOVE_UPDATES_PER_SECOND` (15) sustained with a small burst, checked *before* parsing. Rejected moves never mutate the registry and are answered with `server:error` (`invalid_position` carries the authoritative coordinates so the client can resync).
 - Proximity service: on each validated position update, recompute neighbors within PROXIMITY_RANGE (350 units) for the mover and affected neighbors; emit throttled `proximity:update` (≤ 5 Hz per client).
 - Validation service: finite numbers, bounds check, max displacement per update (anti-teleport), name length/charset, per-socket rate limits.
 - MongoDB: persistence only (never on the real-time path). Write position snapshots at low frequency (e.g., every 5 s per user) and on disconnect.
 
 ## 6. Socket.IO Event Contract
 
+The wire contract lives in **`shared/protocol.js`**, imported by both `client/` and
+`server/`, so an event name or payload shape cannot drift between the two sides.
+Event names are namespaced by the entity they concern: `player:*`, `players:*`,
+`server:*`. Unknown events are ignored (never an error) on both sides, and every
+inbound payload is validated with hand-rolled validators (no validation library).
+
+A "player" is always the full record:
+
+```js
+{ id, name, x, y, dir, moving, joinedAt }   // id is server-minted; dir in radians
+```
+
 Client → Server:
 
 | Event | Payload | Notes |
 |-------|---------|-------|
-| `session:join` | `{ name }` | name 1–24 chars |
-| `position:update` | `{ x, y, dir, moving, clientTs }` | ≤ 15 Hz, validated |
-| `signal:offer` | `{ targetId, sdp }` | relayed |
-| `signal:answer` | `{ targetId, sdp }` | relayed |
-| `signal:ice` | `{ targetId, candidate }` | relayed |
+| `player:join` | `{ name }` | 1–24 characters after whitespace collapsing; `id`/`room` in the payload are ignored. Re-sending it renames (same player id) |
+| `player:move` | `{ x, y, dir, moving, clientTs }` | ≤ 15 Hz, validated, `clientTs` skew ≤ 2 s |
 
 Server → Client:
 
 | Event | Payload | Notes |
 |-------|---------|-------|
-| `session:welcome` | `{ id, name, world, users }` | initial roster + world meta |
-| `user:joined` | `{ user }` | |
-| `user:left` | `{ id }` | |
-| `position:update` | `{ id, x, y, dir, moving, serverTs }` | |
-| `proximity:update` | `{ nearby: [{ id, distance }] }` | ≤ 5 Hz |
-| `signal:offer` / `signal:answer` / `signal:ice` | `{ from, ... }` | relayed |
-| `app:error` | `{ code, message }` | recoverable errors |
+| `players:snapshot` | `{ version, self, players[], room, world, moveHz, serverTs }` | sent to the joiner only: its own record plus the existing roster |
+| `player:joined` | `{ player }` | broadcast to the room; clients **upsert by id** (covers renames) |
+| `player:moved` | `{ id, x, y, dir, moving, serverTs }` | the 15 Hz delta — only the fields that change |
+| `player:left` | `{ id }` | on disconnect (transient state is dropped server-side) |
+| `server:error` | `{ code, message, data? }` | recoverable; `data` carries corrections (`{ x, y }` for `invalid_position`) |
 
-Both sides treat unknown events as no-ops and validate every payload with hand-rolled validators (no extra validation library in v1).
+Error codes: `invalid_name`, `invalid_payload`, `invalid_position`, `rate_limited`,
+`room_full`, `join_required`, `internal_error`.
+
+Authority rules: the registry is the single source of truth for positions; a
+rejected update is answered with a correction and never broadcast; movement is
+relayed only to the room (`socket.to(room)`) and never back to the sender.
 
 ## 7. Database Strategy (MongoDB Atlas)
 

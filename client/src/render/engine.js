@@ -20,6 +20,7 @@ import * as world from './worldRenderer.js'
 import { drawFurnitureItem } from './furniture.js'
 import { blinkState, drawAvatar, drawAvatarLabel } from './avatarRenderer.js'
 import { createLocalAppearance } from './avatarAppearance.js'
+import { LIMITS } from '../../../shared/protocol.js'
 import { createKeyboardInput } from '../input/keyboard.js'
 import {
   AVATAR_RADIUS,
@@ -126,6 +127,18 @@ export function createWorldEngine(options) {
   let hudTimer = 0
   let showLabels = true
   let dragPointer = null
+
+  // Network integration (see docs/ARCHITECTURE.md §6). All three are plain
+  // callbacks so the engine stays network-agnostic and unit-testable:
+  //   peerProvider    -> [] every frame, interpolated remote players
+  //   stateReporter   -> local movement, published at ≤15 Hz
+  //   correctionSource-> authoritative position the server sent after a reject
+  let peerProvider = null
+  let stateReporter = null
+  let correctionSource = null
+  let reportTimer = 0
+  let lastReported = { x: player.x, y: player.y, dir: player.facing, moving: false }
+  let reportedMoves = 0
 
   let dpr = 1
   let viewportWidth = 960
@@ -322,6 +335,13 @@ export function createWorldEngine(options) {
     fpsFrames += 1
 
     updatePlayer(dtSeconds)
+    if (correctionSource) {
+      const correction = correctionSource()
+      if (correction) applyServerPosition(correction.x, correction.y)
+    }
+    if (peerProvider) syncPeersFromProvider(peerProvider(timestamp))
+    advancePeerWalk(dtSeconds)
+    publishState(dtSeconds)
     camera.update(dtSeconds)
     render()
 
@@ -381,6 +401,56 @@ export function createWorldEngine(options) {
 
   function toggleLabels() {
     return setShowLabels(!showLabels)
+  }
+
+  /** Publish local movement at ≤15 Hz (plus an idle heartbeat, so a paused
+   *  avatar still refreshes its position after a correction). */
+  function publishState(dt) {
+    if (!stateReporter) return
+    reportTimer += dt * 1000
+    const interval = 1000 / LIMITS.MOVE_UPDATES_PER_SECOND
+    if (reportTimer < interval) return
+
+    const moved =
+      Math.abs(player.x - lastReported.x) > 0.5 ||
+      Math.abs(player.y - lastReported.y) > 0.5 ||
+      Math.abs(player.facing - lastReported.dir) > 0.08 ||
+      player.moving !== lastReported.moving
+    const heartbeatDue = reportTimer >= 2000
+    if (!moved && !heartbeatDue) {
+      reportTimer = Math.min(reportTimer, interval * 2)
+      return
+    }
+
+    reportTimer = 0
+    lastReported = { x: player.x, y: player.y, dir: player.facing, moving: player.moving }
+    reportedMoves += 1
+    stateReporter({
+      x: Math.round(player.x * 100) / 100,
+      y: Math.round(player.y * 100) / 100,
+      dir: Math.round(player.facing * 1000) / 1000,
+      moving: player.moving,
+    })
+  }
+
+  /**
+   * Snap the local avatar to the position the server accepted. This is the
+   * visible half of "the server is authoritative": after a rejected move the
+   * client stops guessing and adopts the server's coordinates.
+   */
+  function applyServerPosition(x, y) {
+    if (!Number.isFinite(x) || !Number.isFinite(y)) return false
+    const distance = Math.hypot(x - player.x, y - player.y)
+    if (distance < 1) return false
+    player.x = x
+    player.y = y
+    player.vx = 0
+    player.vy = 0
+    colliderQueryCenter = { x: -9999, y: -9999 }
+    if (camera.follow) camera.centerOn(player.x, player.y)
+    lastReported = { x: player.x, y: player.y, dir: player.facing, moving: player.moving }
+    syncHud(true)
+    return true
   }
 
   function teleportTo(id) {
@@ -561,9 +631,91 @@ export function createWorldEngine(options) {
     return removed
   }
 
+  /**
+   * Reconcile the live peer list against the network provider.
+   *
+   * The provider hands back the *same* objects every frame (the presence module
+   * mutates them in place), so this only copies the fields that change at 15 Hz
+   * and keeps render-only state — appearance, blink seed, walk phase, and the
+   * previous frame position used to advance that phase.
+   */
+  function syncPeersFromProvider(list) {
+    const seen = new Set()
+    for (const remote of list) {
+      if (!remote?.id) continue
+      seen.add(remote.id)
+      const existing = peers.get(remote.id)
+      if (!existing) {
+        const peer = normalisePeer(remote)
+        peer.walkPhase = 0
+        peer.lastX = peer.x
+        peer.lastY = peer.y
+        peers.set(remote.id, peer)
+        continue
+      }
+      existing.name = remote.name ?? existing.name
+      existing.x = remote.x
+      existing.y = remote.y
+      existing.facing = remote.facing ?? existing.facing
+      existing.moving = Boolean(remote.moving)
+      if (remote.speaking !== undefined) existing.speaking = Boolean(remote.speaking)
+      if (remote.muted !== undefined) existing.muted = Boolean(remote.muted)
+      if (remote.nearby !== undefined) existing.nearby = Boolean(remote.nearby)
+      if (remote.distance !== undefined) existing.distance = remote.distance
+      if (remote.stale !== undefined) existing.stale = Boolean(remote.stale)
+    }
+    for (const id of [...peers.keys()]) {
+      if (!seen.has(id)) peers.delete(id)
+    }
+  }
+
+  /** Advance the walk cycle of remote avatars from how far they really moved. */
+  function advancePeerWalk(dt) {
+    for (const peer of peers.values()) {
+      const travelled = Math.hypot(peer.x - (peer.lastX ?? peer.x), peer.y - (peer.lastY ?? peer.y))
+      peer.lastX = peer.x
+      peer.lastY = peer.y
+      if (peer.moving && travelled > 0.01) {
+        peer.walkPhase = (peer.walkPhase + travelled / STRIDE_LENGTH) % 1
+      } else if (!peer.moving) {
+        peer.walkPhase = 0
+      }
+      peer.idleTime = (peer.idleTime ?? 0) + dt
+    }
+  }
+
   return {
     start,
     destroy,
+    // network integration (all optional; the engine runs fine without them)
+    setPeerProvider(provider) {
+      peerProvider = typeof provider === 'function' ? provider : null
+      return peerProvider !== null
+    },
+    setStateReporter(reporter) {
+      stateReporter = typeof reporter === 'function' ? reporter : null
+      return stateReporter !== null
+    },
+    setCorrectionSource(source) {
+      correctionSource = typeof source === 'function' ? source : null
+      return correctionSource !== null
+    },
+    reportNow() {
+      if (stateReporter) {
+        lastReported = { x: player.x, y: player.y, dir: player.facing, moving: player.moving }
+        stateReporter({
+          x: Math.round(player.x * 100) / 100,
+          y: Math.round(player.y * 100) / 100,
+          dir: Math.round(player.facing * 1000) / 1000,
+          moving: player.moving,
+        })
+      }
+    },
+    applyServerPosition,
+    setPlayerName(name) {
+      if (typeof name === 'string' && name.trim()) player.name = name.trim()
+      return player.name
+    },
     // camera + view controls
     zoomIn,
     zoomOut,
@@ -589,6 +741,9 @@ export function createWorldEngine(options) {
       showLabels,
       spawnId: spawn.id,
       peers: peers.size,
+      hasPeerProvider: peerProvider !== null,
+      hasStateReporter: stateReporter !== null,
+      reportedMoves,
       keyboardAttached: keyboard.attached,
       hasResizeObserver: Boolean(resizeObserver),
       viewport: { width: viewportWidth, height: viewportHeight, dpr },

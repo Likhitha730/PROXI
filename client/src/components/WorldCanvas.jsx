@@ -1,6 +1,8 @@
 import { useEffect, useRef, useState } from 'react'
 import { createWorldEngine } from '../render/engine.js'
 import { worldStore } from '../state/worldStore.js'
+import { presence } from '../net/presence.js'
+import { sendMove } from '../net/socketClient.js'
 
 /**
  * Mounts the canvas and owns the engine lifecycle.
@@ -9,6 +11,12 @@ import { worldStore } from '../state/worldStore.js'
  * the animation frame, detaches every listener and disconnects the resize
  * observer. React never re-renders per animation frame — the engine reports into
  * `worldStore` at ~5 Hz and the HUD subscribes to that.
+ *
+ * Network integration is three callbacks, so the engine itself stays unaware of
+ * Socket.IO:
+ *   peerProvider     -> interpolated remote players, read every frame
+ *   stateReporter    -> our own movement, published at <=15 Hz
+ *   correctionSource -> authoritative position pushed by the server
  */
 export function WorldCanvas({ playerName = 'You', spawnId, onEngineReady }) {
   const containerRef = useRef(null)
@@ -23,6 +31,9 @@ export function WorldCanvas({ playerName = 'You', spawnId, onEngineReady }) {
     let engine
     try {
       engine = createWorldEngine({ canvas, container, store: worldStore, playerName, spawnId })
+      engine.setPeerProvider((now) => presence.collectPeers(now))
+      engine.setStateReporter((state) => sendMove(state))
+      engine.setCorrectionSource(() => presence.takeCorrection())
       engine.start()
       onEngineReady?.(engine)
       setError(null)

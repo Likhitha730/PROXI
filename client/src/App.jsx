@@ -4,12 +4,13 @@ import { AppFooter } from './components/AppFooter.jsx'
 import { Workspace } from './components/Workspace.jsx'
 import { StatusOverlay } from './components/StatusOverlay.jsx'
 import { connect, destroySocket } from './net/socketClient.js'
-import { useBackendHealth, useConnection, useWorldState } from './state/hooks.js'
+import { useBackendHealth, useConnection, usePresence, useWorldState } from './state/hooks.js'
 
 export default function App() {
   const connection = useConnection()
   const health = useBackendHealth()
   const world = useWorldState()
+  const presence = usePresence()
 
   // Opening the shell opens the realtime session. `connect` is idempotent, so the
   // double effect invocation of React StrictMode in development is harmless.
@@ -25,8 +26,8 @@ export default function App() {
 
   return (
     <div className="app-shell">
-      <AppHeader connection={connection} health={health} />
-      <Workspace connection={connection} health={health} world={world} />
+      <AppHeader connection={connection} health={health} presence={presence} />
+      <Workspace connection={connection} health={health} world={world} presence={presence} />
       <AppFooter connection={connection} health={health} world={world} />
       <StatusOverlay connection={connection} health={health} />
     </div>

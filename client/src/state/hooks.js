@@ -3,6 +3,7 @@
 import { useCallback, useEffect, useState, useSyncExternalStore } from 'react'
 import { connectionStore } from './connectionStore.js'
 import { worldStore } from './worldStore.js'
+import { presence } from '../net/presence.js'
 import { apiUrl, describeTargets } from '../config/env.js'
 
 /** Subscribe to the Socket.IO connection state. */
@@ -18,6 +19,17 @@ export function useConnection() {
  */
 export function useWorldState() {
   return useSyncExternalStore(worldStore.subscribe, worldStore.getSnapshot, worldStore.getSnapshot)
+}
+
+/**
+ * Subscribe to the presence roster (who else is online).
+ *
+ * The presence store only changes its snapshot on structural events — a join,
+ * a leave, a rename, a session change — so 15 Hz movement never re-renders the
+ * component tree.
+ */
+export function usePresence() {
+  return useSyncExternalStore(presence.subscribe, presence.getSnapshot, presence.getSnapshot)
 }
 
 const HEALTH_POLL_MS = 10_000

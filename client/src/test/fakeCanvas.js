@@ -112,7 +112,9 @@ export function installFakeRaf() {
   const stats = { scheduled: 0, cancelled: 0, ran: 0 }
   let pending = null
   let pendingId = 0
-  let now = 0
+  // Timestamps share the real high-resolution clock, exactly like a browser's
+  // requestAnimationFrame, so engine time and network time are comparable.
+  let now = typeof performance !== 'undefined' ? performance.now() : 0
 
   globalThis.requestAnimationFrame = (callback) => {
     pending = callback

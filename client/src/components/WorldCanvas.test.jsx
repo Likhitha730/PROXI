@@ -14,6 +14,7 @@ import { createRoot } from 'react-dom/client'
 import { createFakeContext, installFakeRaf, pressKey } from '../test/fakeCanvas.js'
 import { WorldCanvas } from './WorldCanvas.jsx'
 import { worldStore } from '../state/worldStore.js'
+import { presence } from '../net/presence.js'
 
 let raf
 let container
@@ -58,12 +59,14 @@ function mountWorld(props = {}) {
 beforeEach(() => {
   raf = installFakeRaf()
   worldStore.reset()
+  presence.reset()
   globalThis.devicePixelRatio = 1
 })
 
 afterEach(() => {
   act(() => root?.unmount())
   container?.remove()
+  presence.reset()
   raf.restore()
 })
 
@@ -135,5 +138,92 @@ describe('WorldCanvas', () => {
       })
     }).not.toThrow()
     expect(container.querySelector('[data-testid="world-canvas"]')).not.toBeNull()
+  })
+})
+
+describe('remote players reach the canvas', () => {
+  /** Feed the presence singleton exactly as socketClient does on the wire. */
+  function applySnapshotWithPeer() {
+    presence.applySnapshot({
+      self: { id: 'self-1', name: 'You', x: 1280, y: 1500, dir: Math.PI / 2, moving: false },
+      players: [{ id: 'peer-1', name: 'Ada', x: 900, y: 800, dir: 0, moving: false }],
+      room: { id: 'proxispeak-lobby', maxPlayers: 24 },
+    })
+  }
+
+  it('renders a remote avatar as soon as the roster arrives', () => {
+    mountWorld()
+    act(() => raf.step(1))
+    expect(engineRef.current.getPeers()).toHaveLength(0)
+
+    act(() => applySnapshotWithPeer())
+    act(() => raf.step(1))
+
+    const peers = engineRef.current.getPeers()
+    expect(peers).toHaveLength(1)
+    expect(peers[0]).toMatchObject({ id: 'peer-1', name: 'Ada', isLocal: false })
+    expect(peers[0].appearance).toBeTruthy()
+  })
+
+  it('moves the remote avatar smoothly between 15 Hz network updates', () => {
+    mountWorld()
+    act(() => applySnapshotWithPeer())
+    act(() => raf.step(1))
+
+    // Three network samples, 66 ms apart, walking east at ~205 u/s.
+    const positions = []
+    for (let i = 1; i <= 3; i += 1) {
+      act(() => {
+        presence.applyMove({ id: 'peer-1', x: 900 + i * 13.7, y: 800, dir: 0, moving: true })
+        raf.step(4) // ~66 ms of animation frames per network sample
+      })
+      positions.push(engineRef.current.getPeers()[0].x)
+    }
+
+    // Every frame produced a distinct, monotonically advancing position: the
+    // avatar glides instead of jumping once per network packet.
+    expect(positions[0]).toBeLessThan(positions[1])
+    expect(positions[1]).toBeLessThan(positions[2])
+
+    const avatar = engineRef.current.getPeers()[0]
+    expect(avatar.walkPhase).toBeGreaterThan(0) // walk cycle advanced by real travel
+  })
+
+  it('removes the avatar when the player leaves', () => {
+    mountWorld()
+    act(() => applySnapshotWithPeer())
+    act(() => raf.step(2))
+    expect(engineRef.current.getPeers()).toHaveLength(1)
+
+    act(() => presence.applyLeft({ id: 'peer-1' }))
+    act(() => raf.step(1))
+    expect(engineRef.current.getPeers()).toHaveLength(0)
+  })
+
+  it('snaps the local avatar to the server position after a rejected move', () => {
+    mountWorld()
+    act(() => raf.step(2))
+    const player = engineRef.current.getPlayer()
+    player.x = 1280
+    player.y = 1500
+
+    act(() => {
+      presence.applyError({ code: 'invalid_position', message: 'position rejected', data: { x: 1200, y: 1440 } })
+      raf.step(1)
+    })
+
+    expect(player.x).toBe(1200)
+    expect(player.y).toBe(1440)
+  })
+
+  it('publishes local movement through the socket layer', () => {
+    mountWorld()
+    act(() => raf.step(1))
+    // Without a live socket sendMove() reports false; the engine must not care.
+    pressKey('KeyD')
+    act(() => raf.step(30))
+    pressKey('KeyD', { type: 'keyup' })
+    expect(engineRef.current.getDiagnostics().reportedMoves).toBeGreaterThan(0)
+    expect(engineRef.current.getDiagnostics().hasStateReporter).toBe(true)
   })
 })

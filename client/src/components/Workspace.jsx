@@ -3,6 +3,8 @@ import { describeTargets } from '../config/env.js'
 import { WorldCanvas } from './WorldCanvas.jsx'
 import { WorldControls } from './WorldControls.jsx'
 import { WorldPanel } from './WorldPanel.jsx'
+import { PresencePanel } from './PresencePanel.jsx'
+import { presence as presenceModel } from '../net/presence.js'
 import { WORLD_SUMMARY } from '../world/worldData.js'
 
 function formatDuration(fromTimestamp) {
@@ -21,7 +23,7 @@ function formatDuration(fromTimestamp) {
  * `engineVersion` counter exists only so the controls re-render once when the
  * engine becomes available.
  */
-export function Workspace({ connection, health, world, onEngineReady }) {
+export function Workspace({ connection, health, world, presence, onEngineReady }) {
   const targets = describeTargets()
   const databaseStatus = health.data?.database?.status ?? '—'
   const engineRef = useRef(null)
@@ -42,8 +44,10 @@ export function Workspace({ connection, health, world, onEngineReady }) {
         <div className="stage__header">
           <h2 className="stage__title">World stage</h2>
           <span className="stage__hint">
-            {WORLD_SUMMARY.zones} rooms · {WORLD_SUMMARY.furniture} furniture items · {WORLD_SUMMARY.doors} doors ·
-            local avatar only
+            {WORLD_SUMMARY.zones} rooms · {WORLD_SUMMARY.furniture} furniture items · {WORLD_SUMMARY.doors} doors ·{' '}
+            <span data-testid="stage-player-count">
+              {presence?.count ?? 0} {presence?.count === 1 ? 'player' : 'players'} online
+            </span>
           </span>
         </div>
 
@@ -54,6 +58,12 @@ export function Workspace({ connection, health, world, onEngineReady }) {
 
       <aside className="hud" aria-label="Session details">
         <WorldPanel world={world} />
+
+        <PresencePanel
+          presence={presence}
+          connection={connection}
+          onDismissError={() => presenceModel.clearError()}
+        />
 
         <section className="panel">
           <h3 className="panel__title">Session</h3>
