@@ -1,6 +1,6 @@
 # ProxiSpeak — Development Plan
 
-**Last updated:** 2026-10-11
+**Last updated:** 2026-10-12
 **Scope of this session:** documentation only (this file, PROJECT_REQUIREMENTS.md, ARCHITECTURE.md, .gitignore). No application code, no dependency installation.
 
 ## Guiding Rules
@@ -10,7 +10,14 @@
 - Nothing is "done" until its acceptance criteria are executed and observed.
 - Frontend dev server: Vite port 5173 with `strictPort: true` — fail loudly if the port is occupied.
 
-## Phase 0 — Scaffolding (next session)
+## Phase 0 — Scaffolding ✅ (completed 2026-10-12, Session 1 implementation)
+
+> Session 1 implementation also delivered the first working vertical slice (application shell +
+> health endpoint + Socket.IO handshake). See [SESSION_02_REPORT.md](./SESSION_02_REPORT.md).
+> Verification note: the folder structure, package files, `vite.config.js` and `.env.example` files
+> now exist, dependencies are installed, and `npm run dev` runs both servers (failing loudly when
+> port 5173 is occupied) — all Phase 0 acceptance criteria are executed and observed.
+> Lint tooling is configured (`npm run lint`) and tests run via `npm test`.
 
 Tasks:
 
@@ -54,9 +61,38 @@ Acceptance criteria: panel updates ≤ 5 Hz; lists exactly the users within rang
 
 ## Phase 5 — WebRTC Audio + Spatial Audio
 
-Tasks: proximity-filtered peer connections (450 units, 50-unit hysteresis); signaling relay; STUN; mic permission handling; Web Audio graph (distance gain + stereo pan per peer).
+Status: **fully implemented** — voice in [SESSION_06_REPORT.md](./SESSION_06_REPORT.md),
+the spatial graph and the 2D polish in [SESSION_07_REPORT.md](./SESSION_07_REPORT.md).
+The listening radius is 100 units (not the 450 units this plan originally guessed), with
+12 units of hysteresis.
 
-Acceptance criteria: voice connects only within range; volume decreases and pan shifts with position; teardown on exit; mic denial degrades gracefully with a clear UI state.
+Implemented: proximity-filtered peer connections, server-authorized signalling relay
+with server-derived sender identity, per-session signalling rate limits, STUN/TURN
+configuration served from `/api/ice`, microphone consent on an explicit user action,
+mute, speaking/connection indicators, and teardown on revocation, hang-up or disconnect.
+
+Implemented in Session 7: the managed Web Audio graph per remote stream — distance gain
+`clamp(1 − d / listeningRadius, 0, 1)` in world units, stereo panning where supported,
+`setTargetAtTime` smoothing, fade-in/fade-out around connect and teardown, and a lazily
+created AudioContext resumed from a user gesture. `docs/ARCHITECTURE.md` §9 documents the
+build instead of a plan.
+
+Acceptance criteria met: voice connects only within range; teardown on exit or when the
+listening radius is left; mic denial (and missing device, missing WebRTC) degrades
+gracefully with a clear UI state; volume and pan follow position and are monotonic with
+distance (unit tests over the curve + scripted two-client verification).
+
+## Phase 5c — 2D Interaction Polish
+
+Tasks: idle poses and directional animation; ambient motion in plants and office
+details; proximity rings and a smoothed speaking indicator; readable labels with hover
+and selected-avatar feedback; furniture collision boundaries and a stable camera;
+responsive layout; reduced-motion handling.
+
+Acceptance criteria: animation stays independent of React renders; no per-frame
+allocation and no AudioNodes created in the loop; the office reads clearly at 1 to 48
+avatars. Measured in [SESSION_07_REPORT.md](./SESSION_07_REPORT.md) §5
+(`npm run bench:render`).
 
 ## Phase 6 — Persistence, Polish, Verification
 
@@ -78,3 +114,17 @@ Acceptance criteria: all v1 acceptance criteria in PROJECT_REQUIREMENTS.md §6 p
 ## Exact Next Implementation Step
 
 Phase 0, task 1–2: create the folder structure (`client/`, `server/`) and the root `package.json`, then `client/package.json` (Vite + React + Socket.IO client) and `server/package.json` (Express + Socket.IO + mongodb), plus `client/vite.config.js` with `server: { port: 5173, strictPort: true }` and `.env.example`. Then verify both dev servers start. No application logic in that step.
+
+## Session Log
+
+- **Session 0 (2026-10-12) — Documentation baseline: complete and verified.** Requirements, architecture,
+  development plan and `.gitignore` are in place and cover every required topic; no application code
+  written and no dependencies installed. Findings and open decisions are recorded in
+  [SESSION_01_REPORT.md](./SESSION_01_REPORT.md).
+- **Session 1 (2026-10-12) — Phase 0 + application shell: complete, verified.** React/Vite shell on port
+  5173 (strictPort), Express + Socket.IO on 8080 attached to one HTTP server, `GET /api/health`,
+  explicit `CORS_ORIGIN` allow-list, safe connect/disconnect logging, MongoDB placeholders, graceful
+  shutdown, npm scripts for dev/build/start/lint/test/smoke. 39 automated tests pass, lint is clean,
+  and all manual checks (frontend load, health, browser-path Socket.IO, port-conflict failure,
+  production serving, shutdown) were executed. See [SESSION_02_REPORT.md](./SESSION_02_REPORT.md).
+  Next: Phase 1 — Canvas world rendering and camera.

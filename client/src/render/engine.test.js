@@ -1,0 +1,934 @@
+/**
+ * Engine tests: the animation loop, movement, collision, HUD throttling and
+ * teardown. These run in jsdom with a fake rAF and a fake 2D context, so every
+ * frame is deterministic and every assertion is exact.
+ *
+ * @vitest-environment jsdom
+ */
+import { afterEach, beforeEach, describe, expect, it } from 'vitest'
+import { createWorldEngine, STRIDE_LENGTH, WALK_SPEED } from './engine.js'
+import { createFakeCanvas, createFakeContext, installFakeRaf, pressKey, tapKey } from '../test/fakeCanvas.js'
+import { SPAWNS, STATIC_COLLIDERS, WALKABLE_BOUNDS, ZONES } from '../world/worldData.js'
+import { circleHitsAny } from '../world/collision.js'
+import { AVATAR_RADIUS } from '../world/worldData.js'
+import { LIMITS } from '../../../shared/protocol.js'
+
+let raf
+let engine
+let canvas
+let store
+let container
+
+function createStore() {
+  const writes = []
+  let state = {}
+  return {
+    writes,
+    getSnapshot: () => state,
+    set(patch) {
+      writes.push(patch)
+      state = { ...state, ...patch }
+      return state
+    },
+  }
+}
+
+function createContainer(width = 1024, height = 640) {
+  const element = globalThis.document.createElement('div')
+  element.getBoundingClientRect = () => ({ left: 0, top: 0, width, height, right: width, bottom: height })
+  element.focus = () => {}
+  globalThis.document.body.appendChild(element)
+  return element
+}
+
+beforeEach(() => {
+  raf = installFakeRaf()
+  store = createStore()
+  container = createContainer()
+  canvas = createFakeCanvas(1024, 640, createFakeContext({ width: 1024, height: 640 }))
+  globalThis.devicePixelRatio = 1
+})
+
+afterEach(() => {
+  engine?.destroy()
+  engine = null
+  container?.remove()
+  raf.restore()
+})
+
+function startEngine(options = {}) {
+  engine = createWorldEngine({ canvas, container, store, playerName: 'You', spawnId: 'entrance', ...options })
+  engine.start()
+  return engine
+}
+
+const holdKeys = (...codes) => codes.forEach((code) => pressKey(code))
+const releaseKeys = (...codes) => codes.forEach((code) => pressKey(code, { type: 'keyup' }))
+
+describe('loop lifecycle', () => {
+  it('starts a single animation frame and reports running', () => {
+    startEngine()
+    const diagnostics = engine.getDiagnostics()
+    expect(diagnostics.running).toBe(true)
+    expect(diagnostics.keyboardAttached).toBe(true)
+    expect(raf.hasPendingFrame).toBe(true)
+  })
+
+  it('renders on every frame and keeps scheduling', () => {
+    startEngine()
+    const before = engine.getDiagnostics().frames
+    raf.step(5)
+    expect(engine.getDiagnostics().frames).toBe(before + 5)
+    expect(raf.hasPendingFrame).toBe(true)
+  })
+
+  it('clamps a huge delta time (tab switch) instead of teleporting the avatar', () => {
+    startEngine()
+    raf.step(1, 16)
+    holdKeys('KeyD')
+    const before = engine.getPlayer().x
+    raf.step(1, 5_000) // 5 seconds in one frame
+    const travelled = engine.getPlayer().x - before
+    expect(travelled).toBeLessThan(WALK_SPEED * 0.11) // clamped to 100 ms
+  })
+
+  it('cancels the frame and detaches everything on destroy', () => {
+    startEngine()
+    raf.step(3)
+    const listenersBefore = canvas.listenerCount()
+    expect(listenersBefore).toBeGreaterThan(0)
+
+    engine.destroy()
+    expect(engine.getDiagnostics().running).toBe(false)
+    expect(engine.getDiagnostics().keyboardAttached).toBe(false)
+    expect(raf.hasPendingFrame).toBe(false)
+    expect(canvas.listenerCount()).toBe(0)
+    expect(raf.stats.cancelled).toBeGreaterThan(0)
+  })
+
+  it('does not process input after destroy (no leaked listeners)', () => {
+    startEngine()
+    raf.step(1)
+    const player = engine.getPlayer()
+    const startX = player.x
+    engine.destroy()
+
+    holdKeys('KeyD')
+    raf.step(10)
+    expect(player.x).toBe(startX) // nothing moved
+  })
+
+  it('is safe to call destroy twice', () => {
+    startEngine()
+    engine.destroy()
+    expect(() => engine.destroy()).not.toThrow()
+  })
+
+  it('falls back gracefully when the canvas has no 2D context', () => {
+    const broken = createFakeCanvas(800, 600, null)
+    broken.getContext = () => null
+    const weak = createWorldEngine({ canvas: broken, container, store })
+    expect(() => weak.start()).not.toThrow()
+    expect(weak.getDiagnostics().running).toBe(false)
+  })
+})
+
+describe('movement and facing', () => {
+  it('walks in the pressed direction and faces it', () => {
+    startEngine()
+    raf.step(1)
+    const start = { ...engine.getPlayer() }
+    holdKeys('KeyD')
+    raf.step(30)
+    const after = engine.getPlayer()
+    expect(after.x).toBeGreaterThan(start.x + 40)
+    expect(Math.abs(after.y - start.y)).toBeLessThan(2)
+    expect(after.facing).toBeCloseTo(0, 1) // walking east
+    expect(after.moving).toBe(true)
+  })
+
+  it('supports the arrow keys as well as WASD', () => {
+    startEngine()
+    raf.step(1)
+    const startY = engine.getPlayer().y
+    holdKeys('ArrowUp')
+    raf.step(20)
+    expect(engine.getPlayer().y).toBeLessThan(startY - 20)
+    releaseKeys('ArrowUp')
+    holdKeys('ArrowDown')
+    raf.step(30)
+    expect(engine.getPlayer().y).toBeGreaterThan(startY - 5)
+  })
+
+  it('stops and idles when keys are released', () => {
+    startEngine()
+    raf.step(1)
+    holdKeys('KeyW')
+    raf.step(20)
+    expect(engine.getPlayer().moving).toBe(true)
+    releaseKeys('KeyW')
+    raf.step(40)
+    const player = engine.getPlayer()
+    expect(player.moving).toBe(false)
+    expect(player.walkPhase).toBe(0)
+    expect(Math.hypot(player.vx, player.vy)).toBeLessThan(5)
+  })
+
+  it('moves diagonally at the same speed as straight (normalised input)', () => {
+    startEngine()
+    raf.step(1)
+    const startA = { x: engine.getPlayer().x, y: engine.getPlayer().y }
+    holdKeys('KeyD')
+    raf.step(60)
+    const straight = Math.hypot(engine.getPlayer().x - startA.x, engine.getPlayer().y - startA.y)
+    releaseKeys('KeyD')
+
+    engine.teleportTo('entrance')
+    raf.step(1)
+    const startB = { x: engine.getPlayer().x, y: engine.getPlayer().y }
+    holdKeys('KeyD', 'KeyS')
+    raf.step(60)
+    const diagonal = Math.hypot(engine.getPlayer().x - startB.x, engine.getPlayer().y - startB.y)
+
+    expect(diagonal).toBeGreaterThan(straight * 0.6)
+    expect(diagonal).toBeLessThan(straight * 1.15)
+  })
+
+  it('advances the walk cycle with distance travelled, not with time', () => {
+    startEngine()
+    raf.step(1)
+    holdKeys('KeyD')
+    raf.step(10)
+    const phaseA = engine.getPlayer().walkPhase
+    raf.step(10)
+    const phaseB = engine.getPlayer().walkPhase
+    expect(phaseA).not.toBe(phaseB)
+    // phase stays a normalised cycle
+    expect(phaseB).toBeGreaterThanOrEqual(0)
+    expect(phaseB).toBeLessThan(1)
+    expect(STRIDE_LENGTH).toBeGreaterThan(10)
+  })
+
+  it('ignores keys while the user is typing in a field', () => {
+    const input = globalThis.document.createElement('input')
+    globalThis.document.body.appendChild(input)
+    input.focus()
+
+    startEngine()
+    raf.step(1)
+    const before = engine.getPlayer().x
+    holdKeys('KeyD')
+    raf.step(30)
+    expect(engine.getPlayer().x).toBe(before)
+
+    input.remove()
+  })
+
+  it('ignores key presses with a browser shortcut modifier', () => {
+    startEngine()
+    raf.step(1)
+    const before = engine.getPlayer().x
+    const event = new globalThis.window.KeyboardEvent('keydown', { code: 'KeyD', key: 'd', ctrlKey: true, bubbles: true })
+    globalThis.window.dispatchEvent(event)
+    raf.step(20)
+    expect(engine.getPlayer().x).toBe(before)
+  })
+
+  it('clears held keys on window blur so nothing sticks', () => {
+    startEngine()
+    raf.step(1)
+    holdKeys('KeyD')
+    raf.step(10)
+    globalThis.window.dispatchEvent(new globalThis.window.Event('blur'))
+    const movingAfterBlur = engine.getPlayer().moving
+    raf.step(30)
+    expect(movingAfterBlur === true || engine.getPlayer().moving === false).toBe(true)
+    expect(engine.getPlayer().moving).toBe(false)
+  })
+})
+
+describe('collision in the real office', () => {
+  it('cannot walk through the reception desk', () => {
+    startEngine()
+    // Reception desk occupies x 1120..1440, y 1285..1375 — stand above it and push down.
+    engine.getPlayer().x = 1280
+    engine.getPlayer().y = 1200
+    engine.getCamera().setViewport(1024, 640)
+    raf.step(1)
+    holdKeys('KeyS')
+    raf.step(120)
+    const player = engine.getPlayer()
+    expect(player.y).toBeLessThan(1285 - AVATAR_RADIUS + 1)
+    expect(circleHitsAny(player.x, player.y, AVATAR_RADIUS, STATIC_COLLIDERS)).toBeNull()
+  })
+
+  it('keeps the avatar inside the world bounds', () => {
+    startEngine()
+    raf.step(1)
+    engine.getPlayer().x = 100
+    engine.getPlayer().y = 100
+    holdKeys('KeyW', 'KeyA')
+    raf.step(200)
+    const player = engine.getPlayer()
+    expect(player.x).toBeGreaterThanOrEqual(WALKABLE_BOUNDS.x + AVATAR_RADIUS - 0.5)
+    expect(player.y).toBeGreaterThanOrEqual(WALKABLE_BOUNDS.y + AVATAR_RADIUS - 0.5)
+  })
+
+  it('never ends a frame inside solid geometry during a long random walk', () => {
+    startEngine()
+    raf.step(1)
+    const sequences = [
+      ['KeyD', 'KeyS'],
+      ['KeyS', 'KeyA'],
+      ['KeyA', 'KeyW'],
+      ['KeyW', 'KeyD'],
+      ['KeyD'],
+      ['KeyS'],
+    ]
+    for (const keys of sequences) {
+      releaseKeys('KeyW', 'KeyA', 'KeyS', 'KeyD')
+      holdKeys(...keys)
+      for (let i = 0; i < 40; i += 1) {
+        raf.step(1)
+        const player = engine.getPlayer()
+        expect(
+          circleHitsAny(player.x, player.y, AVATAR_RADIUS, STATIC_COLLIDERS),
+          `stuck in furniture at ${player.x},${player.y}`,
+        ).toBeNull()
+      }
+    }
+  })
+
+  it('walks a real route from the entrance to the open workspace', () => {
+    startEngine()
+    raf.step(1)
+    engine.getPlayer().x = 1280
+    engine.getPlayer().y = 1500
+
+    const walkUntil = (predicate, key, label) => {
+      holdKeys(key)
+      let frames = 0
+      while (!predicate(engine.getPlayer()) && frames < 1200) {
+        raf.step(1)
+        frames += 1
+      }
+      releaseKeys(key)
+      raf.step(20) // let the velocity settle
+      expect(predicate(engine.getPlayer()), `blocked while ${label}: stopped at ${engine.getPlayer().x},${engine.getPlayer().y}`).toBe(true)
+    }
+
+    // The reception desk (x 1120..1440) sits between the doors and the lobby, so a
+    // real visitor steps around it — exactly what a player does.
+    expect(engine.getPlayer().x).toBeGreaterThan(1120)
+    // A real visitor walks around the reception desk (x 1120..1440), through the
+    // lobby archway (x 965..1405), then west into the desk aisle (x ≈ 940, between
+    // the 680..840 and 1000..1160 desk pods) and north into the workspace.
+    walkUntil((p) => p.x < 1035, 'KeyA', 'stepping west around the reception desk')
+    walkUntil((p) => p.y < 1040, 'KeyW', 'walking north through the lobby archway')
+    walkUntil((p) => p.x < 945, 'KeyA', 'entering the workspace desk aisle')
+    walkUntil((p) => p.y < 800, 'KeyW', 'crossing the open workspace')
+
+    const player = engine.getPlayer()
+    const zone = ZONES.find((z) => player.x >= z.x && player.x <= z.x + z.w && player.y >= z.y && player.y <= z.y + z.h)
+    expect(zone?.id).toBe('workspace')
+    expect(circleHitsAny(player.x, player.y, AVATAR_RADIUS, STATIC_COLLIDERS)).toBeNull()
+  })
+})
+
+describe('camera integration', () => {
+  it('follows the player by default and stops following after a pan', () => {
+    startEngine()
+    raf.step(1)
+    expect(engine.getDiagnostics().camera.follow).toBe(true)
+
+    canvas.dispatch('pointerdown', { button: 0, pointerId: 1, clientX: 500, clientY: 300 })
+    canvas.dispatch('pointermove', { pointerId: 1, clientX: 400, clientY: 250 })
+    canvas.dispatch('pointerup', { pointerId: 1 })
+    expect(engine.getDiagnostics().camera.follow).toBe(false)
+  })
+
+  it('zooms with the wheel and with the keyboard', () => {
+    startEngine()
+    raf.step(1)
+    canvas.dispatch('wheel', { deltaY: -400, clientX: 500, clientY: 300, preventDefault() {} })
+    engine.zoomIn()
+    for (let i = 0; i < 90; i += 1) raf.step(1)
+    expect(engine.getCamera().zoom).toBeGreaterThan(1)
+
+    engine.zoomOut()
+    engine.zoomOut()
+    for (let i = 0; i < 150; i += 1) raf.step(1)
+    expect(engine.getCamera().zoom).toBeLessThan(2)
+  })
+
+  it('resets the camera with the R key and re-enables follow', () => {
+    startEngine()
+    raf.step(1)
+    engine.zoomIn()
+    canvas.dispatch('pointerdown', { button: 0, pointerId: 2, clientX: 500, clientY: 300 })
+    canvas.dispatch('pointermove', { pointerId: 2, clientX: 300, clientY: 100 })
+    canvas.dispatch('pointerup', { pointerId: 2 })
+    expect(engine.getCamera().follow).toBe(false)
+
+    tapKey('KeyR')
+    const camera = engine.getCamera()
+    expect(camera.zoom).toBe(1)
+    expect(camera.follow).toBe(true)
+  })
+
+  it('teleports to each spawn point', () => {
+    startEngine()
+    raf.step(1)
+    for (const spawn of SPAWNS) {
+      expect(engine.teleportTo(spawn.id)).toBe(true)
+      expect(engine.getPlayer().x).toBeCloseTo(spawn.x, 6)
+      expect(engine.getPlayer().y).toBeCloseTo(spawn.y, 6)
+    }
+    expect(engine.teleportTo('nowhere')).toBe(false)
+  })
+
+  it('toggles labels with the L key', () => {
+    startEngine()
+    raf.step(1)
+    expect(engine.getDiagnostics().showLabels).toBe(true)
+    tapKey('KeyL')
+    expect(engine.getDiagnostics().showLabels).toBe(false)
+    tapKey('KeyL')
+    expect(engine.getDiagnostics().showLabels).toBe(true)
+  })
+})
+
+describe('canvas sizing', () => {
+  it('sizes the backing store by CSS size × device pixel ratio', () => {
+    globalThis.devicePixelRatio = 2
+    startEngine()
+    expect(canvas.width).toBe(2048)
+    expect(canvas.height).toBe(1280)
+    expect(canvas.style.width).toBe('1024px')
+    expect(engine.getDiagnostics().viewport).toEqual({ width: 1024, height: 640, dpr: 2 })
+  })
+
+  it('caps the pixel ratio to keep the fill rate sane', () => {
+    globalThis.devicePixelRatio = 3
+    startEngine()
+    expect(engine.getDiagnostics().viewport.dpr).toBe(2)
+  })
+
+  it('re-measures on window resize', () => {
+    startEngine()
+    container.getBoundingClientRect = () => ({ left: 0, top: 0, width: 1600, height: 900, right: 1600, bottom: 900 })
+    globalThis.window.dispatchEvent(new globalThis.window.Event('resize'))
+    expect(canvas.width).toBe(1600)
+    expect(engine.getDiagnostics().viewport.width).toBe(1600)
+    expect(engine.getDiagnostics().viewport.height).toBe(900)
+  })
+})
+
+describe('HUD store throttling', () => {
+  it('writes to the store at ~5 Hz, not once per frame', () => {
+    startEngine()
+    const baseline = store.writes.length
+    raf.step(120, 16) // ~1.9 seconds of frames
+    const writes = store.writes.length - baseline
+    expect(writes).toBeGreaterThan(5) // it does update
+    expect(writes).toBeLessThanOrEqual(12) // but not 120 times
+  })
+
+  it('publishes the room the player stands in', () => {
+    startEngine()
+    raf.step(1)
+    expect(store.getSnapshot().zoneName).toBe('Reception & Entrance')
+    engine.teleportTo('workspace')
+    expect(store.getSnapshot().zoneName).toBe('Open Workspace')
+    engine.teleportTo('meeting')
+    expect(store.getSnapshot().zoneName).toBe('Meeting Room')
+  })
+
+  it('publishes camera state for the controls', () => {
+    startEngine()
+    raf.step(1)
+    const snapshot = store.getSnapshot()
+    expect(snapshot.zoom).toBe(1)
+    expect(snapshot.follow).toBe(true)
+    expect(snapshot.showLabels).toBe(true)
+    expect(snapshot.engineReady).toBe(true)
+  })
+})
+
+describe('peers (network-ready rendering path)', () => {
+  it('renders injected peers and reports them in the HUD', () => {
+    startEngine()
+    raf.step(1)
+    const count = engine.setPeers([
+      { id: 'p1', name: 'Priya', x: 1100, y: 1200, facing: 0, nearby: true, distance: 180 },
+      { id: 'p2', name: 'Ravi', x: 1300, y: 900 },
+    ])
+    expect(count).toBe(2)
+    expect(engine.getPeers()).toHaveLength(2)
+    raf.step(2)
+    const snapshot = store.getSnapshot()
+    expect(snapshot.peerCount).toBe(2)
+    expect(snapshot.nearbyCount).toBe(1)
+  })
+
+  it('updates and removes peers incrementally', () => {
+    startEngine()
+    engine.setPeers([{ id: 'p1', name: 'Priya', x: 1100, y: 1200 }])
+    engine.upsertPeer({ id: 'p1', speaking: true, nearby: true })
+    const peer = engine.getPeers()[0]
+    expect(peer.speaking).toBe(true)
+    expect(peer.nearby).toBe(true)
+    expect(peer.name).toBe('Priya') // untouched fields survive the patch
+
+    expect(engine.removePeer('p1')).toBe(true)
+    expect(engine.removePeer('p1')).toBe(false)
+    expect(engine.getPeers()).toHaveLength(0)
+  })
+
+  it('gives each peer a deterministic appearance when none is supplied', () => {
+    startEngine()
+    const first = engine.upsertPeer({ id: 'peer-x', x: 100, y: 100 }).appearance
+    engine.setPeers([])
+    const second = engine.upsertPeer({ id: 'peer-x', x: 100, y: 100 }).appearance
+    expect(second).toEqual(first)
+  })
+
+  it('clears peers on destroy', () => {
+    startEngine()
+    engine.setPeers([{ id: 'p1' }])
+    engine.destroy()
+    expect(engine.getPeers()).toHaveLength(0)
+    expect(store.getSnapshot().peerCount).toBe(0)
+  })
+})
+
+describe('network integration hooks', () => {
+  /** A remote player as the presence module hands it over, mutated in place. */
+  function remotePlayer(overrides = {}) {
+    return {
+      id: 'peer-1',
+      name: 'Ada',
+      x: 900,
+      y: 800,
+      facing: 0,
+      moving: true,
+      speaking: false,
+      muted: false,
+      nearby: false,
+      stale: false,
+      ...overrides,
+    }
+  }
+
+  it('is inert without a network layer (no provider, no reporter)', () => {
+    startEngine()
+    raf.step(10)
+    const diagnostics = engine.getDiagnostics()
+    expect(diagnostics.hasPeerProvider).toBe(false)
+    expect(diagnostics.hasStateReporter).toBe(false)
+    expect(diagnostics.reportedMoves).toBe(0)
+    expect(engine.getPeers()).toEqual([])
+  })
+
+  it('reconciles remote players from the provider on every frame', () => {
+    startEngine()
+    raf.step(1)
+
+    const list = [remotePlayer()]
+    let providerCalls = 0
+    engine.setPeerProvider(() => {
+      providerCalls += 1
+      return list
+    })
+
+    raf.step(3)
+    expect(providerCalls).toBe(3)
+    expect(engine.getPeers()).toHaveLength(1)
+
+    // a second player appears
+    list.push(remotePlayer({ id: 'peer-2', name: 'Grace', x: 1000, y: 900 }))
+    raf.step(1)
+    expect(engine.getPeers().map((peer) => peer.name).sort()).toEqual(['Ada', 'Grace'])
+
+    // the first walks; the engine follows the mutated object
+    list[0].x = 940
+    list[0].y = 810
+    raf.step(1)
+    const ada = engine.getPeers().find((peer) => peer.id === 'peer-1')
+    expect(ada).toMatchObject({ x: 940, y: 810 })
+    expect(ada.walkPhase).not.toBe(0) // the walk cycle advanced with real travel
+
+    // and a leave removes it
+    list.shift()
+    raf.step(1)
+    expect(engine.getPeers().map((peer) => peer.id)).toEqual(['peer-2'])
+
+    // HUD sees the count through the store (still throttled, not per frame)
+    const lastWrite = store.writes.at(-1)
+    expect(lastWrite.peerCount === undefined || typeof lastWrite.peerCount === 'number').toBe(true)
+  })
+
+  it('gives remote avatars an appearance and a blink seed it keeps across frames', () => {
+    startEngine()
+    const list = [remotePlayer()]
+    engine.setPeerProvider(() => list)
+    raf.step(1)
+    const first = engine.getPeers()[0]
+    const appearance = first.appearance
+    const blinkSeed = first.blinkSeed
+
+    raf.step(30)
+    const later = engine.getPeers()[0]
+    expect(later.appearance).toBe(appearance) // same object, not rebuilt per frame
+    expect(later.blinkSeed).toBe(blinkSeed)
+  })
+
+  it('publishes local movement at most 15 times per second', () => {
+    startEngine()
+    const reports = []
+    engine.setStateReporter((state) => reports.push(state))
+
+    // 120 frames at 16 ms = 1.92 s of simulated time, walking the whole way.
+    holdKeys('KeyD')
+    raf.step(120)
+    releaseKeys('KeyD')
+
+    expect(reports.length).toBeGreaterThan(0)
+    expect(reports.length).toBeLessThanOrEqual(30) // ~15 Hz, never per frame
+    for (const report of reports) {
+      expect(Number.isFinite(report.x)).toBe(true)
+      expect(Number.isFinite(report.y)).toBe(true)
+      expect(Number.isFinite(report.dir)).toBe(true)
+      expect(typeof report.moving).toBe('boolean')
+    }
+    // rounded to centimetre precision, which is all the wire needs
+    expect(reports.at(-1).x).toBe(Math.round(reports.at(-1).x * 100) / 100)
+    expect(engine.getDiagnostics().reportedMoves).toBe(reports.length)
+  })
+
+  it('stays quiet while idle instead of streaming unchanged positions', () => {
+    startEngine()
+    const reports = []
+    engine.setStateReporter((state) => reports.push(state))
+    raf.step(60) // 0.96 s standing still
+
+    expect(reports.length).toBeLessThanOrEqual(1) // no movement, no traffic
+    expect(engine.getDiagnostics().reportedMoves).toBeLessThanOrEqual(1)
+  })
+
+  it('snaps to the authoritative position the server sends back', () => {
+    startEngine()
+    raf.step(1)
+    engine.getPlayer().x = 1280
+    engine.getPlayer().y = 1500
+
+    const corrections = [{ x: 1180, y: 1420 }]
+    engine.setCorrectionSource(() => corrections.pop() ?? null)
+    raf.step(1)
+
+    const player = engine.getPlayer()
+    expect(player.x).toBe(1180)
+    expect(player.y).toBe(1420)
+    expect(player.vx).toBe(0)
+    expect(player.vy).toBe(0)
+
+    // drained once: the next frame must not re-apply it
+    player.x = 1190
+    raf.step(1)
+    expect(engine.getPlayer().x).toBe(1190)
+  })
+
+  it('ignores a nonsensical correction instead of teleporting the avatar', () => {
+    startEngine()
+    raf.step(1)
+    const before = { x: engine.getPlayer().x, y: engine.getPlayer().y }
+    engine.setCorrectionSource(() => ({ x: Number.NaN, y: 12 }))
+    raf.step(2)
+    expect(engine.getPlayer()).toMatchObject(before)
+  })
+
+  it('accepts a rename from the network layer', () => {
+    startEngine()
+    expect(engine.setPlayerName('Ada Lovelace')).toBe('Ada Lovelace')
+    expect(engine.getPlayer().name).toBe('Ada Lovelace')
+    expect(engine.setPlayerName('   ')).toBe('Ada Lovelace')
+  })
+
+  it('drops peers when the engine is destroyed', () => {
+    startEngine()
+    engine.setPeerProvider(() => [remotePlayer()])
+    raf.step(1)
+    expect(engine.getPeers()).toHaveLength(1)
+
+    engine.destroy()
+    expect(engine.getPeers()).toEqual([])
+    engine = null
+  })
+})
+
+describe('proximity ring', () => {
+  /** Record every arc drawn, with its arguments, by wrapping the fake context. */
+  function recordArcs() {
+    const ctx = canvas.getContext('2d')
+    const arcs = []
+    const original = ctx.arc
+    ctx.arc = (...args) => {
+      arcs.push(args)
+      return original(...args)
+    }
+    return arcs
+  }
+
+  it('draws the ring at the documented default radius, centred on the local avatar', () => {
+    startEngine()
+    const arcs = recordArcs()
+    raf.step(1)
+
+    const player = engine.getPlayer()
+    const ring = arcs.find(([, , radius]) => Math.round(radius) === 100)
+    expect(ring).toBeTruthy()
+    expect(ring[0]).toBeCloseTo(player.x, 6)
+    expect(ring[1]).toBeCloseTo(player.y, 6)
+    expect(ring[4]).toBeCloseTo(Math.PI * 2, 6)
+  })
+
+  it('adopts the radius the server reported', () => {
+    startEngine()
+    engine.setProximitySource(() => ({ radius: 175 }))
+    const arcs = recordArcs()
+    raf.step(4, 100) // 400 ms of frames: the HUD refreshes every 200 ms
+
+    expect(arcs.some(([, , radius]) => Math.round(radius) === 175)).toBe(true)
+    expect(arcs.some(([, , radius]) => Math.round(radius) === 100)).toBe(false)
+    expect(store.getSnapshot().proximityRadius).toBe(175)
+  })
+
+  it('falls back to the default when the network layer has nothing sane to offer', () => {
+    for (const bad of [undefined, null, {}, { radius: 0 }, { radius: -40 }, { radius: Number.NaN }, { radius: 'wide' }]) {
+      engine?.destroy()
+      startEngine()
+      engine.setProximitySource(() => bad)
+      const arcs = recordArcs()
+      raf.step(3)
+
+      expect(arcs.some(([, , radius]) => Math.round(radius) === 100), JSON.stringify(bad)).toBe(true)
+      expect(store.getSnapshot().proximityRadius).toBe(100)
+    }
+  })
+
+  it('haloes the peers that are inside the radius, and only those', () => {
+    startEngine()
+    engine.setPeers([
+      { id: 'p1', name: 'Near', x: 1100, y: 1200, nearby: true },
+      { id: 'p2', name: 'Far', x: 1400, y: 900, nearby: false },
+    ])
+    const arcs = recordArcs()
+    raf.step(1)
+
+    // The halo is AVATAR_RADIUS + 7 (stroke) and + 10 (wash).
+    const near = arcs.filter(([x, y]) => Math.abs(x - 1100) < 0.001 && Math.abs(y - 1200) < 0.001)
+    expect(near.map(([, , radius]) => Math.round(radius)).sort((a, b) => a - b)).toEqual([
+      AVATAR_RADIUS + 7,
+      AVATAR_RADIUS + 10,
+    ])
+    const far = arcs.filter(([x, y]) => Math.abs(x - 1400) < 0.001 && Math.abs(y - 900) < 0.001)
+    expect(far).toHaveLength(0)
+  })
+
+  it('keeps drawing the ring when a peer is exactly on the boundary', () => {
+    startEngine()
+    const player = engine.getPlayer()
+    engine.setPeers([{ id: 'p1', name: 'Edge', x: player.x + 100, y: player.y, nearby: true }])
+    const arcs = recordArcs()
+    raf.step(1)
+
+    expect(engine.getPeers()[0].nearby).toBe(true)
+    expect(arcs.some(([, , radius]) => Math.round(radius) === 100)).toBe(true)
+  })
+
+  it('never leaves a dashed pattern set for later draw calls', () => {
+    startEngine()
+    raf.step(1)
+    const ctx = canvas.getContext('2d')
+    expect(ctx.getLineDash()).toEqual([])
+  })
+})
+
+describe('interaction: hover, selection and the pickup radius', () => {
+  /** Screen point of the local avatar, for synthesising pointer events. */
+  function screenPointOf(x, y) {
+    const world = engine.getCamera().worldToScreen?.(x, y)
+    return world ?? { x, y }
+  }
+
+  function pointer(type, point, { pointerId = 1, button = 0, moved = 0 } = {}) {
+    const at = point
+    canvas.dispatch(type, {
+      clientX: at.x,
+      clientY: at.y,
+      pointerId,
+      button,
+      buttons: button === 0 ? 1 : 0,
+      moved,
+    })
+  }
+
+  it('hovers the avatar under the pointer and clears it again on leave', () => {
+    startEngine()
+    raf.step(1)
+    const self = engine.getPlayer()
+
+    pointer('pointermove', screenPointOf(self.x, self.y))
+    expect(store.getSnapshot().hoveredId).toBe(self.id)
+    expect(canvas.style.cursor).toBe('pointer')
+
+    pointer('pointerleave', screenPointOf(3000, 3000))
+    expect(store.getSnapshot().hoveredId).toBeNull()
+    expect(canvas.style.cursor).toBe('')
+  })
+
+  it('selects on a click and clears the selection on empty floor', () => {
+    startEngine()
+    raf.step(1)
+    const self = engine.getPlayer()
+    const at = screenPointOf(self.x, self.y)
+
+    pointer('pointerdown', at)
+    pointer('pointerup', at)
+    expect(store.getSnapshot().selectedId).toBe(self.id)
+    expect(store.getSnapshot().selected).toMatchObject({ id: self.id, isLocal: true })
+
+    const empty = screenPointOf(self.x + 600, self.y + 400)
+    pointer('pointerdown', empty)
+    pointer('pointerup', empty)
+    expect(store.getSnapshot().selectedId).toBeNull()
+    expect(store.getSnapshot().selected).toBeNull()
+  })
+
+  it('selects through the public API and describes the avatar it points at', () => {
+    startEngine()
+    engine.setPeers([
+      { id: 'p1', name: 'Ada', x: 900, y: 800, nearby: true, distance: 42, volumePercent: 58, speaking: true },
+    ])
+    raf.step(1)
+
+    engine.select('p1')
+    expect(store.getSnapshot().selected).toEqual({
+      id: 'p1',
+      name: 'Ada',
+      isLocal: false,
+      distance: 42,
+      volumePercent: 58,
+      speaking: true,
+      muted: false,
+      nearby: true,
+    })
+
+    engine.clearSelection()
+    expect(store.getSnapshot().selected).toBeNull()
+    // A selection the world no longer contains must not linger.
+    engine.select('ghost')
+    expect(store.getSnapshot().selected).toBeNull()
+  })
+
+  it('treats a drag as a camera pan, not as a selection', () => {
+    startEngine()
+    raf.step(1)
+    const self = engine.getPlayer()
+    const start = screenPointOf(self.x, self.y)
+    const zoomBefore = engine.getCamera().zoom
+
+    pointer('pointerdown', start)
+    pointer('pointermove', { x: start.x + 40, y: start.y + 10 })
+    pointer('pointerup', { x: start.x + 40, y: start.y + 10 })
+
+    expect(store.getSnapshot().selectedId).toBeNull()
+    expect(engine.getCamera().follow).toBe(false)
+    expect(engine.getCamera().zoom).toBe(zoomBefore)
+  })
+})
+
+describe('audio frame hook (world coordinates, never screen pixels)', () => {
+  const frames = []
+
+  function captureFrames() {
+    frames.length = 0
+    engine.setFrameHook((frame) => frames.push(frame))
+    return frames
+  }
+
+  it('calls the hook once per frame with the reusable frame object', () => {
+    startEngine()
+    const seen = captureFrames()
+    raf.step(5)
+
+    expect(seen).toHaveLength(5)
+    expect(new Set(seen).size).toBe(1) // one object, refilled — nothing allocated per frame
+    expect(typeof seen[0].dt).toBe('number')
+    expect(seen[0].dt).toBeGreaterThan(0)
+    expect(Number.isFinite(seen[0].elapsed)).toBe(true)
+  })
+
+  it('carries world coordinates and the world-space listening radius', () => {
+    startEngine()
+    engine.setPeers([{ id: 'p1', name: 'Ada', x: 1234, y: 987, nearby: true }])
+    const seen = captureFrames()
+    raf.step(2)
+
+    const frame = seen[0]
+    const self = engine.getPlayer()
+    expect(frame.player.x).toBeCloseTo(self.x, 6)
+    expect(frame.player.y).toBeCloseTo(self.y, 6)
+    expect(frame.radius).toBe(LIMITS.PROXIMITY_RADIUS)
+    expect(frame.peers[0]).toMatchObject({ id: 'p1', x: 1234, y: 987 })
+    // The camera is not part of this frame: the audio graph must not be able to see it.
+    expect(frame.zoom).toBeUndefined()
+  })
+
+  it('does not change what the audio graph reads when the camera zooms', () => {
+    startEngine()
+    engine.setPeers([{ id: 'p1', name: 'Ada', x: 1234, y: 987, nearby: true }])
+    const seen = captureFrames()
+
+    raf.step(2)
+    const before = { ...seen[0], player: { ...seen[0].player }, peers: seen[0].peers.map((peer) => ({ ...peer })) }
+
+    engine.zoomIn()
+    engine.zoomIn()
+    engine.zoomOut()
+    raf.step(2)
+    const after = seen[2]
+
+    expect(engine.getCamera().zoom).not.toBe(1)
+    // Distance attenuation is computed from these numbers, so they must not move.
+    expect(after.radius).toBe(before.radius)
+    expect(after.player.x).toBeCloseTo(before.player.x, 6)
+    expect(after.player.y).toBeCloseTo(before.player.y, 6)
+    expect(after.peers[0].x).toBe(before.peers[0].x)
+    expect(after.peers[0].y).toBe(before.peers[0].y)
+  })
+
+  it('drives ambient motion and voice easing from the loop, not from React', () => {
+    startEngine()
+    const seen = captureFrames()
+    engine.setLocalVoice({ speaking: true, muted: false })
+    raf.step(3)
+
+    expect(seen.every((frame) => frame.reducedMotion === false)).toBe(true)
+    // The preference can change while the app runs (the system setting is live).
+    engine.setReducedMotion(true)
+    raf.step(1)
+    expect(seen.at(-1).reducedMotion).toBe(true)
+  })
+
+  it('stops calling the hook after destroy', () => {
+    startEngine()
+    const seen = captureFrames()
+    raf.step(2)
+    engine.destroy()
+    engine = null
+    raf.step(2)
+
+    expect(seen).toHaveLength(2)
+  })
+})

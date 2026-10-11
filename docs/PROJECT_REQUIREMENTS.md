@@ -1,7 +1,7 @@
 # ProxiSpeak — Project Requirements
 
-**Status:** Baseline for implementation
-**Last updated:** 2026-10-11
+**Status:** Baseline for implementation — FR-10 (spatial audio) now implemented
+**Last updated:** 2026-10-12
 **Owner:** Engineering (technical lead)
 
 ## 1. Product Vision
@@ -40,8 +40,8 @@ ProxiSpeak is a premium, real-time virtual office. Users control animated avatar
 | FR-6 | Server broadcasts position updates; clients render all connected users. |
 | FR-7 | Server computes proximity; clients receive a throttled "nearby users" list with distances. |
 | FR-8 | WebRTC peer connections are created only with users inside the audio range and torn down when they leave it. |
-| FR-9 | Microphone permission is requested on first join; denial is handled gracefully with a clear UI state. |
-| FR-10 | Remote audio is played through a Web Audio graph with distance-based gain and stereo panning. |
+| FR-9 | Microphone permission is requested on first join; denial is handled gracefully with a clear UI state. **Implemented as: requested only on an explicit user action** (never on join), which is stricter than this line asks for — see [SESSION_06_REPORT.md](./SESSION_06_REPORT.md) §4. |
+| FR-10 | Remote audio is played through a Web Audio graph with distance-based gain and stereo panning. **Implemented** — one managed graph per stream, `gain = clamp(1 − d / listeningRadius, 0, 1)` in world units, `StereoPannerNode` where supported; see [SESSION_07_REPORT.md](./SESSION_07_REPORT.md) §3. |
 | FR-11 | Connection/disconnection states are surfaced in the UI (connecting, connected, disconnected, error). |
 | FR-12 | Office floor plan includes: reception/entrance, central open workspace, private offices (left and right), meeting room/lounge (top), kitchen and huddle room (right), restrooms (bottom corners), plus desks, chairs, plants, walls. |
 

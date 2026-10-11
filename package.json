@@ -3,12 +3,28 @@
   "version": "0.1.0",
   "private": true,
   "type": "module",
+  "description": "ProxiSpeak — premium real-time virtual office (React + Vite, Express + Socket.IO, WebRTC, Canvas).",
   "scripts": {
+    "dev": "node scripts/dev.mjs",
     "dev:client": "npm --prefix client run dev",
     "dev:server": "npm --prefix server run dev",
-    "build:client": "npm --prefix client run build",
-    "validate:world": "node scripts/validate-world.mjs",
-    "smoke:socket": "node scripts/smoke-socket.mjs"
+    "build": "npm --prefix client run build",
+    "start": "npm --prefix server start",
+    "lint": "eslint .",
+    "test": "npm --prefix client test && npm --prefix server test",
+    "smoke:socket": "node scripts/smoke-socket.mjs",
+    "verify:multiplayer": "node scripts/verify-multiplayer.mjs",
+    "verify:audio": "node scripts/verify-audio.mjs",
+    "bench:proximity": "node scripts/bench-proximity.mjs",
+    "bench:render": "node --expose-gc client/scripts/bench-render.mjs --heap"
+  },
+  "devDependencies": {
+    "@roamhq/wrtc": "^0.10.0",
+    "eslint": "^9.17.0",
+    "eslint-plugin-react": "^7.37.2",
+    "eslint-plugin-react-hooks": "^5.0.0",
+    "globals": "^15.14.0",
+    "socket.io-client": "^4.8.1"
   },
   "engines": {
     "node": ">=20"
