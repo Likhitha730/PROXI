@@ -90,12 +90,46 @@ to create real ones — `.env` files are gitignored and must never be committed.
 | `server/.env` | `MONGODB_COLLECTION` | `positions` | Collection holding one live record per session |
 | `server/.env` | `PROXIMITY_RADIUS` | `100` | Proximity listening radius, world units (1–2000) |
 | `server/.env` | `POSITION_FLUSH_MS` | `2000` | Max write rate per session to MongoDB (250–60000 ms) |
+| `server/.env` | `ICE_STUN_URLS` | `stun:stun.l.google.com:19302` | STUN servers handed to browsers at `GET /api/ice` (comma-separated) |
+| `server/.env` | `ICE_TURN_URL` | *(empty)* | Optional TURN relay (`turn:` / `turns:` only). Empty ⇒ no relay |
+| `server/.env` | `ICE_TURN_USERNAME` | *(empty)* | TURN credential username — a secret, server-side only |
+| `server/.env` | `ICE_TURN_CREDENTIAL` | *(empty)* | TURN credential password — a secret, server-side only |
 | `client/.env` | `VITE_SOCKET_URL` | *(empty = same origin)* | Backend Socket.IO URL |
 | `client/.env` | `VITE_API_URL` | *(empty = same origin)* | Backend REST base URL |
 | `client/.env` | `VITE_APP_NAME` | `ProxiSpeak` | Header product name |
+| `client/.env` | `VITE_ICE_STUN_URLS` | *(empty)* | Development-only ICE override; normally leave empty and let `GET /api/ice` decide |
+| `client/.env` | `VITE_ICE_TURN_URL` | *(empty)* | Development-only TURN override. **Never a real credential** — see below |
+| `client/.env` | `VITE_ICE_TURN_USERNAME` | *(empty)* | Development-only TURN username |
+| `client/.env` | `VITE_ICE_TURN_CREDENTIAL` | *(empty)* | Development-only TURN password |
 
 `client/.env.example` and `server/.env.example` contain placeholders only — never real credentials.
-`VITE_*` values are inlined into the browser bundle, so they must never hold secrets.
+`VITE_*` values are inlined into the browser bundle, so they must never hold secrets. That is why TURN
+credentials belong in `server/.env` (served at runtime from `GET /api/ice`) and **not** in `VITE_ICE_*`,
+which exist only as a local development convenience.
+
+## Voice (proximity audio)
+
+When two avatars come within the listening radius (100 world units, 12 units of hysteresis once a call
+is up) **and both have switched their microphone on**, the server authorizes the pair and the two
+browsers open a direct `RTCPeerConnection` between themselves. Audio never passes through the backend:
+it only relays SDP and ICE. Walking out of earshot, muting, hanging up or disconnecting closes the
+connection and releases the microphone and every audio element.
+
+* The microphone is requested **only** when you press **Enable microphone** — never on load, never on
+  join. Denied permission, a missing device or a browser without WebRTC each show a clear state and
+  leave the rest of the app working.
+* **Mute** stops sending audio without tearing the call down; the peer sees a `muted` badge.
+* The **Voice** panel shows the microphone state in words, one row per voice connection with
+  speaking/connecting state, and the listening radius in use.
+
+### Connectivity and TURN
+
+STUN is configured server-side (`ICE_STUN_URLS`) and served to browsers at `GET /api/ice`; the client
+falls back to a public STUN server when that endpoint is unreachable. **STUN alone is not always
+enough**: peers behind symmetric NATs, corporate firewalls or networks that block UDP need a **TURN
+relay** to connect. Configure one with `ICE_TURN_URL`, `ICE_TURN_USERNAME` and `ICE_TURN_CREDENTIAL`
+in `server/.env` (never committed); `GET /api/ice` then reports `hasTurn: true`, and the panel says so
+when a connection fails. Without a relay, calls still work on localhost, a LAN, and most home networks.
 
 ## API
 
@@ -103,6 +137,7 @@ to create real ones — `.env` files are gitignored and must never be committed.
 |--------|------|-------------|
 | `GET` | `/api` | Service metadata + endpoint list |
 | `GET` | `/api/health` | Liveness/readiness JSON. Secrets and environment values are never included. |
+| `GET` | `/api/ice` | ICE configuration for browsers: `{ iceServers, hasTurn, ttlSeconds }`, `Cache-Control: no-store`. TURN credentials are served here at runtime rather than built into the bundle. |
 | `GET` | `/socket.io/...` | Socket.IO handshake (WebSocket + polling) |
 
 `/api/health` response shape:
@@ -172,10 +207,14 @@ Executed results are recorded in [`docs/SESSION_02_REPORT.md`](docs/SESSION_02_R
 | Milestone | Content | Status |
 |-----------|---------|--------|
 | Session 0 | Requirements, architecture, development plan | done |
-| Session 1 | App shell, backend health + socket, tooling | **this PR** |
-| Phase 1 | Canvas world rendering, camera | next |
-| Phase 2 | Local avatar, keyboard movement, collision | planned |
-| Phase 3 | Presence + movement sync, remote interpolation | planned |
-| Phase 4 | Proximity detection, nearby panel | planned |
-| Phase 5 | WebRTC voice + spatial audio | planned |
-| Phase 6 | MongoDB persistence, polish, E2E verification | planned |
+| Session 1 | App shell, backend health + socket, tooling | done |
+| Phase 1 | Canvas world rendering, camera | done |
+| Phase 2 | Local avatar, keyboard movement, collision | done |
+| Phase 3 | Presence + movement sync, remote interpolation | done |
+| Phase 4 | Proximity detection, nearby panel | done |
+| Phase 5 | WebRTC voice (proximity-gated, peer-to-peer) | done — see `docs/SESSION_06_REPORT.md` |
+| Phase 5b | Spatial audio: distance gain + stereo panning | **not implemented** (deferred) |
+| Phase 6 | MongoDB persistence, polish, E2E verification | done (persistence: `docs/SESSION_05_REPORT.md`) |
+
+Per-session detail lives in `docs/SESSION_0*_REPORT.md`; each report states what was verified and what
+could not be verified in the environment it ran in.

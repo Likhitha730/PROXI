@@ -1,5 +1,13 @@
 # Session 6 report — real proximity-based WebRTC audio signalling
 
+> **Numbering note.** This is the session you asked for as **“Session 5: real
+> proximity-based WebRTC audio signalling for ProxiSpeak.”** It is filed as
+> `SESSION_06_REPORT.md` because the report filenames count every session run in this
+> repository, and yours number one lower from here on: your “Session 4” (MongoDB +
+> proximity) is `SESSION_05_REPORT.md`, your “Session 3” (multiplayer) is
+> `SESSION_04_REPORT.md`, and so on. Same work, two numbering schemes — the reports are
+> the record of it.
+
 Scope: this session adds proximity **voice**. Two sessions inside the 100-unit
 listening radius, each with a live microphone, get one `RTCPeerConnection` each and
 exchange audio directly — peer to peer, never through the server. The server's job is
