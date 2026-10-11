@@ -107,6 +107,42 @@ afterEach(() => {
   socketClient.destroySocket()
 })
 
+describe('proximity wiring', () => {
+  it('binds exactly one proximity listener and forwards it into presence', async () => {
+    socketClient.connect()
+    currentSocket.simulateConnect()
+    await flush()
+
+    expect(currentSocket.countListeners(EVENTS.PROXIMITY)).toBe(1)
+
+    currentSocket.trigger(EVENTS.SNAPSHOT, {
+      self: { id: 'self-1', name: 'Me', x: 1280, y: 1500 },
+      players: [{ id: 'player-a', name: 'Ada', x: 1300, y: 1500, dir: 0, moving: false }],
+      room: { id: 'proxispeak-lobby' },
+    })
+    currentSocket.trigger(EVENTS.PROXIMITY, {
+      id: 'self-1',
+      radius: 100,
+      at: Date.now(),
+      neighbours: [{ id: 'player-a', name: 'Ada', x: 1300, y: 1500, distance: 20, nearby: true }],
+    })
+
+    expect(presence.getProximity()).toMatchObject({ radius: 100, count: 1 })
+    expect(presence.getSnapshot().proximity.nearby[0]).toMatchObject({ name: 'Ada', distance: 20 })
+  })
+
+  it('drops nearby state when the connection is lost', async () => {
+    socketClient.connect()
+    currentSocket.simulateConnect()
+    await flush()
+    currentSocket.trigger(EVENTS.PROXIMITY, { radius: 100, neighbours: [{ id: 'p', name: 'P', distance: 5 }] })
+    expect(presence.getProximity().count).toBe(1)
+
+    currentSocket.disconnect()
+    expect(presence.getProximity()).toMatchObject({ radius: 100, count: 0 })
+  })
+})
+
 describe('connection lifecycle', () => {
   it('creates exactly one socket and never double-subscribes on repeated connects', () => {
     socketClient.connect()
@@ -115,7 +151,7 @@ describe('connection lifecycle', () => {
 
     expect(ioMock).toHaveBeenCalledTimes(1)
     // one listener per protocol event, no matter how often connect() is called
-    for (const event of [EVENTS.SNAPSHOT, EVENTS.JOINED, EVENTS.MOVED, EVENTS.LEFT, EVENTS.ERROR]) {
+    for (const event of [EVENTS.SNAPSHOT, EVENTS.JOINED, EVENTS.MOVED, EVENTS.LEFT, EVENTS.PROXIMITY, EVENTS.ERROR]) {
       expect(currentSocket.countListeners(event), event).toBe(1)
     }
     expect(currentSocket.countListeners('connect')).toBe(1)

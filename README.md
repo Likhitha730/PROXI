@@ -56,10 +56,17 @@ npm run dev:client   # frontend only
 npm run smoke:socket                                        # direct to the backend
 SMOKE_URL=http://127.0.0.1:5173 npm run smoke:socket        # through the Vite proxy (browser path)
 
+npm run verify:multiplayer                                  # two scripted clients: presence + proximity
+node scripts/bench-proximity.mjs                            # proximity/engine measurements, honestly labelled
+
 npm run lint         # eslint over client, server and scripts
 npm test             # client unit tests + server unit/integration tests (Vitest, no DB needed)
 npm run build        # production build of the client into client/dist
 ```
+
+`npm test` needs no MongoDB: the persistence code path is covered against the in-process
+double in `server/src/test/fakeMongo.js` (documented in `docs/ARCHITECTURE.md` §7 and
+`docs/SESSION_05_REPORT.md`).
 
 `npm run build && NODE_ENV=production npm start` serves the built frontend and the API from the single
 Express origin on port 8080.
@@ -79,6 +86,9 @@ to create real ones — `.env` files are gitignored and must never be committed.
 | `server/.env` | `SHUTDOWN_TIMEOUT_MS` | `10000` | Graceful-shutdown budget |
 | `server/.env` | `MONGODB_URI` | *(empty)* | Atlas connection string; empty ⇒ persistence disabled, health still `ok` |
 | `server/.env` | `MONGODB_DB` | `proxispeak` | Database name |
+| `server/.env` | `MONGODB_COLLECTION` | `positions` | Collection holding one live record per session |
+| `server/.env` | `PROXIMITY_RADIUS` | `100` | Proximity listening radius, world units (1–2000) |
+| `server/.env` | `POSITION_FLUSH_MS` | `2000` | Max write rate per session to MongoDB (250–60000 ms) |
 | `client/.env` | `VITE_SOCKET_URL` | *(empty = same origin)* | Backend Socket.IO URL |
 | `client/.env` | `VITE_API_URL` | *(empty = same origin)* | Backend REST base URL |
 | `client/.env` | `VITE_APP_NAME` | `ProxiSpeak` | Header product name |

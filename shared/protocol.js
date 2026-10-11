@@ -32,6 +32,7 @@ export const EVENTS = Object.freeze({
   JOINED: 'player:joined',
   MOVED: 'player:moved',
   LEFT: 'player:left',
+  PROXIMITY: 'proximity:update',
   ERROR: 'server:error',
 })
 
@@ -42,6 +43,7 @@ export const SERVER_TO_CLIENT_EVENTS = Object.freeze([
   EVENTS.JOINED,
   EVENTS.MOVED,
   EVENTS.LEFT,
+  EVENTS.PROXIMITY,
   EVENTS.ERROR,
 ])
 export const ALL_EVENTS = Object.freeze([...CLIENT_TO_SERVER_EVENTS, ...SERVER_TO_CLIENT_EVENTS])
@@ -85,6 +87,21 @@ export const LIMITS = Object.freeze({
   INTERPOLATION_DELAY_MS: 120,
   EXTRAPOLATION_LIMIT_MS: 150,
 
+  /**
+   * Proximity: users within this many world units are "nearby" (they are the ones
+   * the audio sessions will connect). 100 u is roughly two desk widths — close
+   * enough that talking is natural, far enough not to trigger across the office.
+   */
+  PROXIMITY_RADIUS: 100,
+  /** Proximity recalculation budget per client. */
+  PROXIMITY_UPDATES_PER_SECOND: 4,
+  /** Recompute only after the player has moved this far since the last result. */
+  PROXIMITY_MIN_MOVEMENT: 8,
+  /** A neighbour must be at least this close to count as "in range" again. */
+  PROXIMITY_HYSTERESIS: 12,
+  /** Cap on neighbours returned in one proximity result. */
+  PROXIMITY_MAX_NEIGHBOURS: 16,
+
   /** Cap on simultaneous players per room. */
   MAX_PLAYERS_PER_ROOM: 24,
 })
@@ -98,6 +115,61 @@ export const SPAWN_POINTS = Object.freeze([
   Object.freeze({ id: 'workspace', x: 920, y: 800 }),
   Object.freeze({ id: 'meeting', x: 640, y: 300 }),
 ])
+
+/**
+ * One neighbour entry inside a proximity result.
+ *
+ * @typedef {{
+ *   id: string, name: string, x: number, y: number, distance: number, nearby: true
+ * }} ProximityNeighbour
+ */
+
+/**
+ * The proximity result: who is within `radius` of a player, with their current
+ * positions and exact planar distances. Sorted nearest first, self excluded, and
+ * de-duplicated by id — the internal shape is the wire shape, so what the server
+ * computes is exactly what it broadcasts.
+ *
+ * @param {{
+ *   id: string,
+ *   radius: number,
+ *   neighbours: Array<ProximityNeighbour>,
+ *   at?: number,
+ * }} input
+ */
+export function createProximityResult({ id, radius, neighbours, at = Date.now() }) {
+  return {
+    id,
+    radius,
+    neighbours: neighbours.map((neighbour) => ({
+      id: neighbour.id,
+      name: neighbour.name,
+      x: roundCoord(neighbour.x),
+      y: roundCoord(neighbour.y),
+      distance: roundCoord(neighbour.distance),
+      nearby: true,
+    })),
+    at,
+  }
+}
+
+/**
+ * True when two proximity results would look the same to a client: same set of
+ * ids with the same distance bucket. Used to throttle broadcasts — a player
+ * drifting 0.4 u must not generate traffic.
+ */
+export function proximityResultsEqual(a, b, bucketUnits = 1) {
+  if (!a || !b) return false
+  if (a.radius !== b.radius) return false
+  if (a.neighbours.length !== b.neighbours.length) return false
+  for (let index = 0; index < a.neighbours.length; index += 1) {
+    const left = a.neighbours[index]
+    const right = b.neighbours[index]
+    if (left.id !== right.id) return false
+    if (Math.abs(left.distance - right.distance) >= bucketUnits) return false
+  }
+  return true
+}
 
 /** Error codes carried by `server:error`. */
 export const ERROR_CODES = Object.freeze({

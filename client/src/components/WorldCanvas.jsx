@@ -17,6 +17,7 @@ import { sendMove } from '../net/socketClient.js'
  *   peerProvider     -> interpolated remote players, read every frame
  *   stateReporter    -> our own movement, published at <=15 Hz
  *   correctionSource -> authoritative position pushed by the server
+ *   proximitySource  -> the listening radius the server reported (for the ring)
  */
 export function WorldCanvas({ playerName = 'You', spawnId, onEngineReady }) {
   const containerRef = useRef(null)
@@ -34,6 +35,7 @@ export function WorldCanvas({ playerName = 'You', spawnId, onEngineReady }) {
       engine.setPeerProvider((now) => presence.collectPeers(now))
       engine.setStateReporter((state) => sendMove(state))
       engine.setCorrectionSource(() => presence.takeCorrection())
+      engine.setProximitySource(() => presence.getProximity())
       engine.start()
       onEngineReady?.(engine)
       setError(null)

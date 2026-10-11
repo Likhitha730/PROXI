@@ -38,6 +38,19 @@ export function createPlayerRegistry({ idFactory = randomUUID, now = Date.now } 
       return null
     },
 
+    /**
+     * The socket currently hosting a player id, or null.
+     *
+     * Player ids are what the protocol exposes; socket ids are what the server needs
+     * to address one connection. Proximity uses this to tell *people* about a move.
+     */
+    socketIdFor(playerId) {
+      for (const [socketId, entry] of bySocketId) {
+        if (entry.player.id === playerId) return socketId
+      }
+      return null
+    },
+
     /** Full player records, newest last. Used for snapshots and joins. */
     list() {
       return [...bySocketId.values()].map(toRecord)

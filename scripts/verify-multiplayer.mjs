@@ -57,7 +57,7 @@ function connect(name) {
   })
   socket.__name = name
   socket.__events = []
-  for (const event of [EVENTS.SNAPSHOT, EVENTS.JOINED, EVENTS.MOVED, EVENTS.LEFT, EVENTS.ERROR]) {
+  for (const event of [EVENTS.SNAPSHOT, EVENTS.JOINED, EVENTS.MOVED, EVENTS.LEFT, EVENTS.PROXIMITY, EVENTS.ERROR]) {
     socket.on(event, (payload) => socket.__events.push({ event, payload }))
   }
   return socket
@@ -74,6 +74,38 @@ async function join(socket, name) {
   const snapshot = waitFor(socket, EVENTS.SNAPSHOT, { label: `snapshot for ${name}` })
   socket.emit(EVENTS.JOIN, { name })
   return snapshot
+}
+
+/**
+ * Walk along a straight line the way a browser must: the server enforces 205 u/s
+ * plus slack, so one long jump is rejected. Steps stay inside the allowance and the
+ * pause exceeds the 4 Hz proximity interval, which also refreshes our own distances.
+ */
+async function walkTo(socket, from, to, { stepUnits = 45, pauseMs = 280 } = {}) {
+  const dx = to.x - from.x
+  const dy = to.y - from.y
+  const steps = Math.max(1, Math.ceil(Math.hypot(dx, dy) / stepUnits))
+  for (let index = 1; index <= steps; index += 1) {
+    const progress = index / steps
+    socket.emit(EVENTS.MOVE, {
+      x: from.x + dx * progress,
+      y: from.y + dy * progress,
+      dir: 0,
+      moving: true,
+      clientTs: Date.now(),
+    })
+    await sleep(pauseMs)
+  }
+  return { x: to.x, y: to.y }
+}
+
+/** The most recent proximity result this socket received, if any. */
+function lastProximity(socket) {
+  return socket.__events.filter((entry) => entry.event === EVENTS.PROXIMITY).at(-1)?.payload ?? null
+}
+
+function nearbyNames(socket) {
+  return (lastProximity(socket)?.neighbours ?? []).map((entry) => entry.name)
 }
 
 async function main() {
@@ -145,6 +177,71 @@ async function main() {
   const rateLimited = alice.__events.some((entry) => entry.event === EVENTS.ERROR && entry.payload.code === 'rate_limited')
   record('a movement flood is rate limited', rateLimited, `${beforeFlood} broadcasts before the burst`)
 
+  // --- proximity ------------------------------------------------------------
+  // The server announces the listening radius on join and again whenever the set of
+  // nearby players changes.
+  const aliceProximity = lastProximity(alice)
+  record(
+    'a joining session is told its listening radius',
+    aliceProximity?.radius === 100 && Array.isArray(aliceProximity.neighbours),
+    `radius=${aliceProximity?.radius} neighbours=${aliceProximity?.neighbours?.length ?? 'n/a'}`,
+  )
+  record(
+    'a player is never listed as their own neighbour',
+    (aliceProximity?.neighbours ?? []).every((entry) => entry.id !== aliceSnapshot.self.id),
+    `self=${aliceSnapshot.self.id.slice(0, 8)}`,
+  )
+
+  // Walk Bob away, then back towards Alice, so the check exercises real movement
+  // rather than a teleport the server would (correctly) reject.
+  const bobStart = { x: bobSnapshot.self.x, y: bobSnapshot.self.y }
+  const far = { x: bobStart.x + 320, y: bobStart.y }
+  await walkTo(bob, bobStart, far)
+  await sleep(300)
+  record(
+    'a player outside the radius is not nearby',
+    !nearbyNames(bob).includes('Alice'),
+    `bob sees [${nearbyNames(bob).join(', ') || 'nobody'}] after walking away`,
+  )
+
+  // Alice stands still; Bob walks back until he is inside her radius.
+  const aliceSeesBobApproach = waitFor(alice, EVENTS.PROXIMITY, {
+    filter: (payload) => payload.neighbours.some((entry) => entry.name === 'Bob'),
+    label: 'Alice is told that Bob walked into range',
+  })
+  await walkTo(bob, far, { x: aliceSnapshot.self.x + 40, y: aliceSnapshot.self.y })
+  await sleep(300)
+
+  let aliceNotified = null
+  try {
+    aliceNotified = await aliceSeesBobApproach
+  } catch {
+    aliceNotified = null
+  }
+  record(
+    'a stationary player is told when somebody walks into range',
+    Boolean(aliceNotified),
+    aliceNotified ? `distance=${Math.round(aliceNotified.neighbours[0].distance)}u` : 'no proximity:update received',
+  )
+
+  const bobNearby = lastProximity(bob)?.neighbours ?? []
+  record(
+    'the walker sees the player they approached, with a distance',
+    bobNearby.some((entry) => entry.name === 'Alice' && Number.isFinite(entry.distance)),
+    `bob sees [${bobNearby.map((entry) => `${entry.name}@${Math.round(entry.distance)}u`).join(', ') || 'nobody'}]`,
+  )
+  record(
+    'nearby entries carry a position, a distance and a deduplicated id',
+    bobNearby.every(
+      (entry) =>
+        Number.isFinite(entry.x) &&
+        Number.isFinite(entry.y) &&
+        Number.isFinite(entry.distance) &&
+        entry.nearby === true,
+    ) && new Set(bobNearby.map((entry) => entry.id)).size === bobNearby.length,
+    `${bobNearby.length} entr${bobNearby.length === 1 ? 'y' : 'ies'}`,
+  )
+
   // --- disconnect cleanup --------------------------------------------------
   const movesBeforeLeave = alice.__events.filter(
     (entry) => entry.event === EVENTS.MOVED && entry.payload.id === bobSnapshot.self.id,
@@ -163,6 +260,15 @@ async function main() {
     'the removed player stops producing updates',
     movesAfterLeave === movesBeforeLeave,
     `${movesAfterLeave - movesBeforeLeave} updates after the disconnect`,
+  )
+
+  // A disconnected session must vanish from everyone's nearby list immediately.
+  await sleep(300)
+  const afterLeave = lastProximity(alice)
+  record(
+    'a disconnected player is removed from the nearby list',
+    !(afterLeave?.neighbours ?? []).some((entry) => entry.id === left.id),
+    `alice sees [${(afterLeave?.neighbours ?? []).map((entry) => entry.name).join(', ') || 'nobody'}]`,
   )
 
   alice.disconnect()

@@ -12,7 +12,9 @@
     "start": "npm --prefix server start",
     "lint": "eslint .",
     "test": "npm --prefix client test && npm --prefix server test",
-    "smoke:socket": "node scripts/smoke-socket.mjs"
+    "smoke:socket": "node scripts/smoke-socket.mjs",
+    "verify:multiplayer": "node scripts/verify-multiplayer.mjs",
+    "bench:proximity": "node scripts/bench-proximity.mjs"
   },
   "devDependencies": {
     "eslint": "^9.17.0",

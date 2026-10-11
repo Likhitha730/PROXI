@@ -24,6 +24,9 @@ export function PresencePanel({ presence, connection, onDismissError }) {
   const connected = connection?.status === 'connected'
   const self = presence?.self ?? null
   const others = presence?.players ?? []
+  const nearby = presence?.proximity?.nearby ?? []
+  const radius = presence?.proximity?.radius ?? LIMITS.PROXIMITY_RADIUS
+  const nearbyIds = new Set(nearby.map((entry) => entry.id))
 
   function applyName(event) {
     event.preventDefault()
@@ -83,12 +86,44 @@ export function PresencePanel({ presence, connection, onDismissError }) {
         ) : (
           others.map((player) => (
             <li key={player.id} className="presence__item">
-              <span className="presence__dot" aria-hidden="true" />
+              <span
+                className={nearbyIds.has(player.id) ? 'presence__dot presence__dot--nearby' : 'presence__dot'}
+                aria-hidden="true"
+              />
               <span className="presence__player">{player.name}</span>
             </li>
           ))
         )}
       </ul>
+
+      {/*
+        Proximity: who the server considers close enough to hear, with the distance
+        it measured. This is the same data that draws the ring around the local
+        avatar, so the list and the world can never tell different stories.
+      */}
+      <div className="presence__nearby" data-testid="presence-nearby-block">
+        <h4 className="presence__subtitle">
+          Nearby
+          <span className="presence__radius">within {Math.round(radius)} u</span>
+        </h4>
+        <ul className="presence__list presence__list--nearby" data-testid="presence-nearby">
+          {nearby.length === 0 ? (
+            <li className="presence__empty">
+              {connected ? 'Nobody within earshot — walk closer to someone.' : 'Offline.'}
+            </li>
+          ) : (
+            nearby.map((entry) => (
+              <li key={entry.id} className="presence__item presence__item--nearby">
+                <span className="presence__dot presence__dot--nearby" aria-hidden="true" />
+                <span className="presence__player">{entry.name}</span>
+                <span className="presence__distance" data-testid={`presence-distance-${entry.name}`}>
+                  {entry.distance === null ? '—' : `${Math.round(entry.distance)} u`}
+                </span>
+              </li>
+            ))
+          )}
+        </ul>
+      </div>
 
       {presence?.lastError ? (
         <p className="panel__error" data-testid="presence-error">

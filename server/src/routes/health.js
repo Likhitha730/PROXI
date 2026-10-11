@@ -5,6 +5,7 @@
 
 import { Router } from 'express'
 import process from 'node:process'
+import { LIMITS } from '../../../shared/protocol.js'
 import { getDatabaseStatus } from '../db/mongo.js'
 
 export function createHealthRouter({ config }) {
@@ -23,7 +24,15 @@ export function createHealthRouter({ config }) {
       // Coarse persistence state only — the driver reports "disabled" when
       // MONGODB_URI is not configured, which is a valid state for this milestone.
       database: getDatabaseStatus(),
-      realtime: { socketio: true, path: '/socket.io' },
+      // The proximity radius is a shared constant (not configuration of the
+      // deployment), so it is published the same way the move rate is: clients need
+      // it to draw the ring even before the first proximity result arrives.
+      realtime: {
+        socketio: true,
+        path: '/socket.io',
+        moveHz: LIMITS.MOVE_UPDATES_PER_SECOND,
+        proximityRadius: config.proximityRadius ?? LIMITS.PROXIMITY_RADIUS,
+      },
     })
   })
 

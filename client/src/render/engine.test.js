@@ -664,3 +664,91 @@ describe('network integration hooks', () => {
     engine = null
   })
 })
+
+describe('proximity ring', () => {
+  /** Record every arc drawn, with its arguments, by wrapping the fake context. */
+  function recordArcs() {
+    const ctx = canvas.getContext('2d')
+    const arcs = []
+    const original = ctx.arc
+    ctx.arc = (...args) => {
+      arcs.push(args)
+      return original(...args)
+    }
+    return arcs
+  }
+
+  it('draws the ring at the documented default radius, centred on the local avatar', () => {
+    startEngine()
+    const arcs = recordArcs()
+    raf.step(1)
+
+    const player = engine.getPlayer()
+    const ring = arcs.find(([, , radius]) => Math.round(radius) === 100)
+    expect(ring).toBeTruthy()
+    expect(ring[0]).toBeCloseTo(player.x, 6)
+    expect(ring[1]).toBeCloseTo(player.y, 6)
+    expect(ring[4]).toBeCloseTo(Math.PI * 2, 6)
+  })
+
+  it('adopts the radius the server reported', () => {
+    startEngine()
+    engine.setProximitySource(() => ({ radius: 175 }))
+    const arcs = recordArcs()
+    raf.step(4, 100) // 400 ms of frames: the HUD refreshes every 200 ms
+
+    expect(arcs.some(([, , radius]) => Math.round(radius) === 175)).toBe(true)
+    expect(arcs.some(([, , radius]) => Math.round(radius) === 100)).toBe(false)
+    expect(store.getSnapshot().proximityRadius).toBe(175)
+  })
+
+  it('falls back to the default when the network layer has nothing sane to offer', () => {
+    for (const bad of [undefined, null, {}, { radius: 0 }, { radius: -40 }, { radius: Number.NaN }, { radius: 'wide' }]) {
+      engine?.destroy()
+      startEngine()
+      engine.setProximitySource(() => bad)
+      const arcs = recordArcs()
+      raf.step(3)
+
+      expect(arcs.some(([, , radius]) => Math.round(radius) === 100), JSON.stringify(bad)).toBe(true)
+      expect(store.getSnapshot().proximityRadius).toBe(100)
+    }
+  })
+
+  it('haloes the peers that are inside the radius, and only those', () => {
+    startEngine()
+    engine.setPeers([
+      { id: 'p1', name: 'Near', x: 1100, y: 1200, nearby: true },
+      { id: 'p2', name: 'Far', x: 1400, y: 900, nearby: false },
+    ])
+    const arcs = recordArcs()
+    raf.step(1)
+
+    // The halo is AVATAR_RADIUS + 7 (stroke) and + 10 (wash).
+    const near = arcs.filter(([x, y]) => Math.abs(x - 1100) < 0.001 && Math.abs(y - 1200) < 0.001)
+    expect(near.map(([, , radius]) => Math.round(radius)).sort((a, b) => a - b)).toEqual([
+      AVATAR_RADIUS + 7,
+      AVATAR_RADIUS + 10,
+    ])
+    const far = arcs.filter(([x, y]) => Math.abs(x - 1400) < 0.001 && Math.abs(y - 900) < 0.001)
+    expect(far).toHaveLength(0)
+  })
+
+  it('keeps drawing the ring when a peer is exactly on the boundary', () => {
+    startEngine()
+    const player = engine.getPlayer()
+    engine.setPeers([{ id: 'p1', name: 'Edge', x: player.x + 100, y: player.y, nearby: true }])
+    const arcs = recordArcs()
+    raf.step(1)
+
+    expect(engine.getPeers()[0].nearby).toBe(true)
+    expect(arcs.some(([, , radius]) => Math.round(radius) === 100)).toBe(true)
+  })
+
+  it('never leaves a dashed pattern set for later draw calls', () => {
+    startEngine()
+    raf.step(1)
+    const ctx = canvas.getContext('2d')
+    expect(ctx.getLineDash()).toEqual([])
+  })
+})

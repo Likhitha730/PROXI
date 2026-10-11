@@ -27,6 +27,7 @@ import {
 } from '../../../shared/protocol.js'
 import { createPlayerRegistry } from '../realtime/registry.js'
 import { createTokenBucket } from '../realtime/rateLimiter.js'
+import { createProximityEngine } from '../realtime/proximity.js'
 
 const TRANSPORT_UPGRADE = 'upgrade'
 
@@ -53,9 +54,20 @@ function connectionMeta(socket) {
  * @param {import('socket.io').Server} io
  * @param {{ logger: object, config?: object, registry?: object, roomId?: string }} deps
  */
-export function registerSocketHandlers(io, { logger, config, registry = createPlayerRegistry(), roomId = DEFAULT_ROOM_ID } = {}) {
+export function registerSocketHandlers(
+  io,
+  {
+    logger,
+    config,
+    registry = createPlayerRegistry(),
+    positions = null,
+    roomId = DEFAULT_ROOM_ID,
+    now = () => Date.now(),
+  } = {},
+) {
   const log = logger.child('socket')
   const room = Object.freeze({ id: roomId, maxPlayers: LIMITS.MAX_PLAYERS_PER_ROOM })
+  const radius = config?.proximityRadius ?? LIMITS.PROXIMITY_RADIUS
 
   const stats = {
     joins: 0,
@@ -65,7 +77,25 @@ export function registerSocketHandlers(io, { logger, config, registry = createPl
     rejectedMoves: 0,
     droppedByRateLimit: 0,
     invalidPayloads: 0,
+    proximityUpdates: 0,
+    persistedWrites: 0,
+    persistFailures: 0,
   }
+
+  // Proximity is computed from the registry (live connections only), never from
+  // MongoDB: a disconnected session must vanish from "nearby" immediately, and a
+  // database round trip has no place in a 4 Hz loop.
+  const proximity = createProximityEngine({
+    registry,
+    radius,
+    now,
+    onUpdate: (socketId, result) => {
+      const target = io.sockets.sockets.get(socketId)
+      if (!target) return
+      target.emit(EVENTS.PROXIMITY, result)
+      stats.proximityUpdates += 1
+    },
+  })
 
   io.on('connection', (socket) => {
     const meta = connectionMeta(socket)
@@ -81,6 +111,32 @@ export function registerSocketHandlers(io, { logger, config, registry = createPl
 
     const sendError = (code, message, data) => {
       socket.emit(EVENTS.ERROR, createError(code, message, data))
+    }
+
+    let lastPersistAt = 0
+
+    /**
+     * Persist the player's position. Fire-and-forget by design: the realtime path
+     * must not wait for (or fail because of) the database, and the repository
+     * already converts failures into logged warnings.
+     */
+    const persist = (player, { force = false } = {}) => {
+      if (!positions || !player) return
+      const at = now()
+      if (!force && at - lastPersistAt < (config?.positionFlushMs ?? 2000)) return
+      lastPersistAt = at
+      positions
+        .savePosition({
+          sessionId: player.id,
+          name: player.name,
+          x: player.x,
+          y: player.y,
+          connected: true,
+        })
+        .then((result) => {
+          if (result?.ok === false) stats.persistFailures += 1
+          else stats.persistedWrites += 1
+        })
     }
 
     /** Tell the client where the server thinks it is (authoritative correction). */
@@ -149,6 +205,13 @@ export function registerSocketHandlers(io, { logger, config, registry = createPl
       stats.joins += 1
       socket.join(room.id)
 
+      // Persist the spawn position immediately so the archive has an entry from
+      // the first moment of the session (no-op when the database is unavailable).
+      lastPersistAt = now()
+      persist(registration.player, { force: true })
+      // Track before announcing, so this player is included in everyone's result.
+      proximity.track(socket.id)
+
       const others = registry.list().filter((player) => player.id !== registration.player.id)
       socket.emit(
         EVENTS.SNAPSHOT,
@@ -156,6 +219,10 @@ export function registerSocketHandlers(io, { logger, config, registry = createPl
       )
       // Everyone already in the room learns about the newcomer.
       socket.to(room.id).emit(EVENTS.JOINED, { player: registration.player })
+
+      // Membership changed, so every proximity result is recomputed and published
+      // at once — a join is never delayed by the movement throttle.
+      proximity.updateAll()
 
       log.info('player joined', {
         socketId: socket.id,
@@ -222,6 +289,12 @@ export function registerSocketHandlers(io, { logger, config, registry = createPl
           moving: player.moving,
         }),
       )
+
+      // Our position changed: recompute our own neighbourhood, and also the players
+      // whose range we may have just entered or left — otherwise somebody standing
+      // still would never notice that a colleague walked up to them.
+      proximity.updateAffected(socket.id)
+      persist(player)
     })
 
     // --------------------------------------------------------- disconnect ---
@@ -229,10 +302,17 @@ export function registerSocketHandlers(io, { logger, config, registry = createPl
     // Exactly one disconnect handler per socket; it removes all transient state
     // (registry entry, per-socket bucket) and notifies the room.
     socket.on('disconnect', (reason) => {
+      proximity.forget(socket.id)
       const removed = registry.remove(socket.id)
       if (removed) {
         stats.leaves += 1
+        // The archive keeps the (now flagged) record; live presence does not.
+        positions?.markDisconnected(removed.id)?.then?.((result) => {
+          if (result?.ok === false) stats.persistFailures += 1
+        })
         socket.to(room.id).emit(EVENTS.LEFT, { id: removed.id })
+        // Everyone left behind gets a fresh neighbourhood without the leaver.
+        proximity.updateAll()
         log.info('player left', { socketId: socket.id, playerId: removed.id, players: registry.size, reason })
       } else {
         log.info('socket disconnected', { socketId: socket.id, reason })
@@ -244,5 +324,5 @@ export function registerSocketHandlers(io, { logger, config, registry = createPl
     log.warn('CORS_ORIGIN is set to "*" — every origin may connect. Use exact origins outside local experiments.')
   }
 
-  return { registry, room, stats }
+  return { registry, room, stats, proximity, radius }
 }

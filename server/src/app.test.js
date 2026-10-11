@@ -3,6 +3,7 @@
 
 import { afterAll, beforeAll, describe, expect, it } from 'vitest'
 import { io as ioClient } from 'socket.io-client'
+import { LIMITS } from '../../shared/protocol.js'
 import { createServer } from './index.js'
 import { parseConfig } from './config/env.js'
 import { createLogger } from './lib/logger.js'
@@ -82,6 +83,11 @@ describe('GET /api/health', () => {
     expect(body.uptimeSeconds).toBeGreaterThanOrEqual(0)
     // Persistence is disabled without MONGODB_URI — and that is a valid state.
     expect(body.database.status).toBe('disabled')
+
+    // The client needs the proximity radius to draw its ring, even before the first
+    // proximity result arrives — it is a shared constant, not deployment config.
+    expect(body.realtime.proximityRadius).toBe(LIMITS.PROXIMITY_RADIUS)
+    expect(body.realtime.moveHz).toBe(LIMITS.MOVE_UPDATES_PER_SECOND)
 
     const serialised = JSON.stringify(body)
     expect(serialised).not.toMatch(/mongodb(\+srv)?:\/\//i)

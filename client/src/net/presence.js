@@ -14,9 +14,26 @@
 // Movement therefore never touches React state. That is the whole reason the two
 // views are separated here.
 
+import { LIMITS } from '../../../shared/protocol.js'
 import { createAvatarAppearance } from '../render/avatarAppearance.js'
 import { createMotionBuffer } from '../render/interpolation.js'
 import { hashString } from '../world/random.js'
+
+/**
+ * The HUD shows a distance per nearby player. Re-rendering React on every 4 Hz
+ * proximity frame would contradict the rule that network traffic must not drive
+ * the render tree, so the *displayed* state is refreshed no faster than this and
+ * only when something a human could notice changed (the nearby set, or a whole
+ * world unit of distance).
+ */
+const PROXIMITY_UI_INTERVAL_MS = 500
+
+const INITIAL_PROXIMITY = Object.freeze({
+  radius: LIMITS.PROXIMITY_RADIUS,
+  at: null,
+  nearby: Object.freeze([]),
+  count: 0,
+})
 
 const INITIAL_SNAPSHOT = Object.freeze({
   ready: false,
@@ -27,6 +44,7 @@ const INITIAL_SNAPSHOT = Object.freeze({
   lastError: null,
   corrections: 0,
   acceptedMoves: 0,
+  proximity: INITIAL_PROXIMITY,
 })
 
 /**
@@ -42,6 +60,16 @@ export function createPresence({ now = () => performance.now() } = {}) {
   let room = null
   let corrections = 0
   let acceptedMoves = 0
+
+  /** `proximity:update` state: the listening radius and who is inside it. */
+  let proximity = INITIAL_PROXIMITY
+  /**
+   * What the HUD currently displays, used to decide whether React must run again:
+   * the set of nearby ids (membership) and their rounded distances.
+   */
+  let publishedNearbyIds = null
+  let publishedDistanceSignature = null
+  let lastProximityNotifyAt = 0
   /** Pending authoritative position from the server, drained by the engine. */
   let pendingCorrection = null
 
@@ -59,6 +87,7 @@ export function createPresence({ now = () => performance.now() } = {}) {
       count: players.length + (self ? 1 : 0),
       corrections,
       acceptedMoves,
+      proximity,
       ...patch,
     })
     for (const listener of listeners) listener()
@@ -103,6 +132,64 @@ export function createPresence({ now = () => performance.now() } = {}) {
     peer.motion.push({ x: record.x, y: record.y, dir: peer.facing, moving: peer.moving, at: now() })
     peers.set(record.id, peer)
     return peer
+  }
+
+  /**
+   * Turn a server proximity result into HUD state.
+   *
+   * The peer objects are updated immediately (the canvas ring reads them every
+   * frame), but `rebuildSnapshot` — and therefore React — only runs when the set of
+   * nearby players changed, or when the rounded distance for someone already in the
+   * list moved by at least one world unit and the UI refresh interval has elapsed.
+   */
+  function applyProximityPayload(payload) {
+    const radius = Number.isFinite(payload?.radius) ? payload.radius : proximity.radius
+    const at = Number.isFinite(payload?.at) ? payload.at : null
+    const entries = []
+    const seen = new Set()
+
+    for (const neighbour of Array.isArray(payload?.neighbours) ? payload.neighbours : []) {
+      // Defensive: the server dedupes, but a duplicate must never reach the HUD.
+      if (!neighbour?.id || seen.has(neighbour.id)) continue
+      // ...and we are never our own neighbour.
+      if (self && neighbour.id === self.id) continue
+      seen.add(neighbour.id)
+      entries.push(
+        Object.freeze({
+          id: neighbour.id,
+          name: neighbour.name ?? peers.get(neighbour.id)?.name ?? 'Guest',
+          distance: Number.isFinite(neighbour.distance) ? neighbour.distance : null,
+          x: Number.isFinite(neighbour.x) ? neighbour.x : null,
+          y: Number.isFinite(neighbour.y) ? neighbour.y : null,
+        }),
+      )
+    }
+    entries.sort((a, b) => (a.distance ?? Infinity) - (b.distance ?? Infinity))
+
+    // Authoritative membership is what the canvas uses to light up peers.
+    for (const peer of peers.values()) {
+      const inRange = seen.has(peer.id)
+      peer.nearby = inRange
+      peer.distance = inRange ? (entries.find((entry) => entry.id === peer.id)?.distance ?? null) : null
+    }
+
+    proximity = Object.freeze({ radius, at, nearby: Object.freeze(entries), count: entries.length })
+
+    const ids = entries.map((entry) => entry.id).join('|')
+    const distances = entries.map((entry) => `${entry.id}:${Math.round(entry.distance ?? -1)}`).join('|')
+    const membershipChanged = ids !== publishedNearbyIds
+    const distanceChanged = distances !== publishedDistanceSignature
+    const stamp = now()
+
+    // Membership changes are shown at once; distance-only changes are rate-limited,
+    // because a walking player would otherwise re-render the HUD four times a second.
+    if (membershipChanged || (distanceChanged && stamp - lastProximityNotifyAt >= PROXIMITY_UI_INTERVAL_MS)) {
+      publishedNearbyIds = ids
+      publishedDistanceSignature = distances
+      lastProximityNotifyAt = stamp
+      rebuildSnapshot()
+    }
+    return proximity
   }
 
   return {
@@ -197,6 +284,24 @@ export function createPresence({ now = () => performance.now() } = {}) {
       return snapshot
     },
 
+    /** `proximity:update` — who is inside the listening radius, with distances. */
+    applyProximity(payload) {
+      return applyProximityPayload(payload)
+    },
+
+    /**
+     * The local player's proximity view. Read once per frame by the canvas ring, so
+     * it must stay allocation-free: `proximity` is replaced, never mutated.
+     */
+    getProximity() {
+      return proximity
+    },
+
+    /** The listening radius the server is using, in world units. */
+    get proximityRadius() {
+      return proximity.radius
+    },
+
     /** Clear a displayed error (used by the HUD dismiss button). */
     clearError() {
       if (!snapshot.lastError) return snapshot
@@ -235,6 +340,10 @@ export function createPresence({ now = () => performance.now() } = {}) {
       corrections = 0
       acceptedMoves = 0
       pendingCorrection = null
+      proximity = INITIAL_PROXIMITY
+      publishedNearbyIds = null
+      publishedDistanceSignature = null
+      lastProximityNotifyAt = 0
       snapshot = INITIAL_SNAPSHOT
       for (const listener of listeners) listener()
     },

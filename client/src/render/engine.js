@@ -18,9 +18,9 @@
 import { Camera } from './camera.js'
 import * as world from './worldRenderer.js'
 import { drawFurnitureItem } from './furniture.js'
+import { LIMITS } from '../../../shared/protocol.js'
 import { blinkState, drawAvatar, drawAvatarLabel } from './avatarRenderer.js'
 import { createLocalAppearance } from './avatarAppearance.js'
-import { LIMITS } from '../../../shared/protocol.js'
 import { createKeyboardInput } from '../input/keyboard.js'
 import {
   AVATAR_RADIUS,
@@ -64,6 +64,13 @@ function zoneAt(x, y) {
  *   spawnId?: string,
  * }} options
  */
+/**
+ * The listening radius the ring is drawn with before the server has told us its
+ * own value. Mirrors LIMITS.PROXIMITY_RADIUS — the server always wins once a
+ * `proximity:update` has arrived.
+ */
+export const DEFAULT_PROXIMITY_RADIUS = LIMITS.PROXIMITY_RADIUS
+
 export function createWorldEngine(options) {
   const {
     canvas,
@@ -136,6 +143,9 @@ export function createWorldEngine(options) {
   let peerProvider = null
   let stateReporter = null
   let correctionSource = null
+  // Proximity: the listening radius and the nearby set both come from the network
+  // layer, so the engine only needs one read-only callback (see drawProximityRing).
+  let proximitySource = null
   let reportTimer = 0
   let lastReported = { x: player.x, y: player.y, dir: player.facing, moving: false }
   let reportedMoves = 0
@@ -258,6 +268,64 @@ export function createWorldEngine(options) {
     }
   }
 
+  /**
+   * The proximity ring: a soft floor glow plus a crisp edge at exactly the listening
+   * radius, drawn around the local avatar *under* furniture and avatars so it reads
+   * as something on the floor. Remote players inside it also get a halo, so the
+   * ring and the "nearby" list can never disagree about who is in range.
+   */
+  function drawProximityRing() {
+    const reported = proximitySource?.()
+    const rawRadius = Number(reported?.radius)
+    const radius = Number.isFinite(rawRadius) && rawRadius > 0 ? rawRadius : DEFAULT_PROXIMITY_RADIUS
+
+    ctx.save()
+
+    const glow = ctx.createRadialGradient(player.x, player.y, radius * 0.1, player.x, player.y, radius)
+    glow.addColorStop(0, 'rgba(122, 226, 255, 0.14)')
+    glow.addColorStop(0.72, 'rgba(122, 226, 255, 0.07)')
+    glow.addColorStop(1, 'rgba(122, 226, 255, 0)')
+    ctx.fillStyle = glow
+    ctx.beginPath()
+    ctx.arc(player.x, player.y, radius, 0, Math.PI * 2)
+    ctx.fill()
+
+    // Two rings: a wide translucent band that reads at any zoom, and a dashed line
+    // that makes the exact boundary legible.
+    ctx.strokeStyle = 'rgba(126, 224, 255, 0.30)'
+    ctx.lineWidth = 6
+    ctx.beginPath()
+    ctx.arc(player.x, player.y, radius, 0, Math.PI * 2)
+    ctx.stroke()
+
+    ctx.strokeStyle = 'rgba(160, 240, 255, 0.55)'
+    ctx.lineWidth = 2.5
+    ctx.setLineDash([14, 10])
+    ctx.lineDashOffset = -((elapsed * 12) % 24)
+    ctx.beginPath()
+    ctx.arc(player.x, player.y, radius, 0, Math.PI * 2)
+    ctx.stroke()
+    ctx.setLineDash([])
+
+    // Halo under every nearby remote player: the visual counterpart of the list.
+    for (const peer of peers.values()) {
+      if (!peer.nearby) continue
+      const distance = Math.hypot(peer.x - player.x, peer.y - player.y)
+      const strength = Math.max(0.12, 1 - distance / radius)
+      ctx.fillStyle = `rgba(126, 224, 255, ${(0.10 + strength * 0.16).toFixed(3)})`
+      ctx.beginPath()
+      ctx.arc(peer.x, peer.y, AVATAR_RADIUS + 10, 0, Math.PI * 2)
+      ctx.fill()
+      ctx.strokeStyle = `rgba(170, 245, 255, ${(0.25 + strength * 0.45).toFixed(3)})`
+      ctx.lineWidth = 2
+      ctx.beginPath()
+      ctx.arc(peer.x, peer.y, AVATAR_RADIUS + 7, 0, Math.PI * 2)
+      ctx.stroke()
+    }
+
+    ctx.restore()
+  }
+
   function drawNames() {
     const view = camera.visibleWorldRect()
     const label = (avatar) => {
@@ -285,6 +353,7 @@ export function createWorldEngine(options) {
     world.drawWalls(ctx, camera)
     world.drawDoors(ctx, camera)
     world.drawLightPools(ctx, camera)
+    drawProximityRing()
     drawSceneDepth()
     world.drawWallArt(ctx, camera)
     ctx.restore()
@@ -295,6 +364,12 @@ export function createWorldEngine(options) {
   }
 
   // ------------------------------------------------------------ HUD sync ---
+
+  /** The radius actually in use: the server's, or the documented default. */
+  function proximityRadius() {
+    const raw = Number(proximitySource?.()?.radius)
+    return Number.isFinite(raw) && raw > 0 ? raw : DEFAULT_PROXIMITY_RADIUS
+  }
 
   function syncHud(force = false) {
     const zone = zoneAt(player.x, player.y)
@@ -318,6 +393,7 @@ export function createWorldEngine(options) {
       follow: camera.follow,
       showLabels,
       nearbyCount,
+      proximityRadius: proximityRadius(),
       peerCount: peers.size,
       ...(force ? { spawnId: spawn.id } : {}),
     })
@@ -696,6 +772,11 @@ export function createWorldEngine(options) {
       stateReporter = typeof reporter === 'function' ? reporter : null
       return stateReporter !== null
     },
+    /** Network layer hook: returns `{ radius }` for the ring (see presence.getProximity). */
+    setProximitySource(source) {
+      proximitySource = typeof source === 'function' ? source : null
+    },
+
     setCorrectionSource(source) {
       correctionSource = typeof source === 'function' ? source : null
       return correctionSource !== null

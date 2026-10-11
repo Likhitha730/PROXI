@@ -96,9 +96,8 @@ signalling services land in `server/src/realtime/` in a later session.
 - Presence service (`server/src/sockets/handlers.js`): join/rename/snapshot, roster broadcast, movement relay, disconnect cleanup (one `disconnect` handler per socket; listeners registered exactly once per connection). Identity and room membership are server-owned: any `id`/`room` field a client sends inside `player:join` is ignored.
 - One socket can never create two players: a second `player:join` with a different name is a *rename* (same id, re-announced as an upsert); with the same name it is a no-op. The room is a single server-assigned lobby, capped at `MAX_PLAYERS_PER_ROOM` (24).
 - Validation service (`shared/protocol.js`, used authoritatively by `server/src/sockets/handlers.js`): finite numbers, walkable-world bounds, max displacement per update (anti-teleport), name length/charset, `clientTs` skew. Rate limiting (`server/src/realtime/rateLimiter.js`) is a token bucket: `MOVE_UPDATES_PER_SECOND` (15) sustained with a small burst, checked *before* parsing. Rejected moves never mutate the registry and are answered with `server:error` (`invalid_position` carries the authoritative coordinates so the client can resync).
-- Proximity service: on each validated position update, recompute neighbors within PROXIMITY_RANGE (350 units) for the mover and affected neighbors; emit throttled `proximity:update` (≤ 5 Hz per client).
-- Validation service: finite numbers, bounds check, max displacement per update (anti-teleport), name length/charset, per-socket rate limits.
-- MongoDB: persistence only (never on the real-time path). Write position snapshots at low frequency (e.g., every 5 s per user) and on disconnect.
+- Proximity service (`server/src/realtime/proximity.js`): a uniform spatial grid (cell size = radius) over **live registry state only**, queried as a 3x3 cell block — with 100 u cells that block is guaranteed to contain every possible neighbour, so the result is exact. Radius `LIMITS.PROXIMITY_RADIUS` (**100 world units**), published at most `PROXIMITY_UPDATES_PER_SECOND` (**4 Hz**) per client, recomputed only after `PROXIMITY_MIN_MOVEMENT` (**8 u**) of movement, with `PROXIMITY_HYSTERESIS` (**12 u**) keeping an existing neighbour until they leave radius + 12. Results are capped at `PROXIMITY_MAX_NEIGHBOURS` (16). On an accepted move the mover **and** every player whose range it may have entered or left are recomputed (`updateAffected`); joins and leaves force a full sweep immediately, so membership changes never wait for a throttle.
+- Persistence (`server/src/db/*`): MongoDB is an archive, never a dependency of the real-time path. Positions are upserted per session at most once per `POSITION_FLUSH_MS` (default 2 s) plus once on join, the archive is marked on disconnect, stale records are pruned and expired by a TTL index, and every operation degrades to a logged `{ ok: false }` when the database is unavailable.
 
 ## 6. Socket.IO Event Contract
 
@@ -129,6 +128,7 @@ Server → Client:
 | `player:joined` | `{ player }` | broadcast to the room; clients **upsert by id** (covers renames) |
 | `player:moved` | `{ id, x, y, dir, moving, serverTs }` | the 15 Hz delta — only the fields that change |
 | `player:left` | `{ id }` | on disconnect (transient state is dropped server-side) |
+| `proximity:update` | `{ id, radius, neighbours[], at }` | the documented proximity result: nearest first, self excluded, deduplicated; each neighbour is `{ id, name, x, y, distance, nearby: true }`. Sent on join, when the neighbour set changes, and (at ≤ 4 Hz) when distances have moved enough to be worth redrawing |
 | `server:error` | `{ code, message, data? }` | recoverable; `data` carries corrections (`{ x, y }` for `invalid_position`) |
 
 Error codes: `invalid_name`, `invalid_payload`, `invalid_position`, `rate_limited`,
@@ -140,13 +140,61 @@ relayed only to the room (`socket.to(room)`) and never back to the sender.
 
 ## 7. Database Strategy (MongoDB Atlas)
 
-- Official `mongodb` driver; single `MongoClient`, SRV connection string from `MONGODB_URI` env; retryWrites enabled.
-- **Coordinate representation:** GeoJSON `Point { type: "Point", coordinates: [x, y] }` — world x stored as GeoJSON "longitude", y as "latitude". Planar approximation is valid because the world is small and we only need relative distances; `$maxDistance` is interpreted in the same units as the coordinates.
-- Collections:
-  - `users`: `{ _id, name, createdAt, lastSeenAt }`
-  - `positionSnapshots`: `{ _id, userId, location (Point), ts }` with a `2dsphere` index on `location` and a TTL index on `ts` (e.g., 7 days).
-- Spatial queries: `$near` / `$maxDistance` for "who was near X" analytics. Real-time proximity is computed in memory — the DB is never in the hot path.
-- Failure handling: a DB outage must not break real-time. Persistence writes are fire-and-forget with error logging; the driver's topology monitoring handles reconnect.
+Status: **implemented** (`server/src/db/`). MongoDB stores the archive of where
+people have been; it is deliberately *not* on the real-time path.
+
+- Official `mongodb` Node driver (6.x), one `MongoClient`, connection string from
+  `MONGODB_URI` (never logged, never returned by any endpoint), database name from
+  `MONGODB_DB`, collection from `MONGODB_COLLECTION` (default `positions`).
+- **Coordinate representation: a planar pair, `location: [x, y]`, with a legacy `2d`
+  index.** The office is a flat 2560 x 1600 pixel world, so the coordinates are *not*
+  longitude/latitude: GeoJSON + `2dsphere` would interpret them as degrees on a
+  sphere (metric distances, converging meridians) and reject any `y > 90`, which this
+  world exceeds by an order of magnitude. A `2d` index treats the pair as a plane and
+  answers distances in the same world units.
+- Index bounds: `2d` index with `min: 0, max: 2560` (a `2d` index range is square, so
+  the bound must cover the longer axis; the world's y range simply occupies the lower
+  part of it).
+- Collection `positions`, one live document per session:
+
+  ```js
+  {
+    sessionId: "<server-minted player uuid>",  // unique: one live record per session
+    name: "Ada",
+    location: [x, y],                          // planar pair, 2d-indexed
+    connected: true,                           // false after the session ends
+    schemaVersion: 1,
+    firstSeenAt: Date,
+    updatedAt: Date
+  }
+  ```
+
+- Indexes, created idempotently at startup (`server/src/db/indexes.js`): `location_2d`
+  (`2d`, 0-2560), `sessionId_unique` (unique — enforces one record per session under
+  concurrent upserts) and `updatedAt_ttl` (TTL, 24 h). Existing indexes are inspected
+  first: identical ones are left alone, an existing index with the same key but
+  different options is reported as a conflict and **never dropped automatically**, and
+  driver errors (including `NamespaceNotFound` 26 and `IndexAlreadyExists` 68) are
+  logged, never fatal.
+- Queries (`server/src/db/positions.js`):
+  - `{ location: { $near: [x, y], $maxDistance: r } }` — ascending planar distance in
+    world units, filtered by `connected: true`, a freshness window on `updatedAt`, and
+    `sessionId: { $ne: self }`;
+  - `{ location: { $geoWithin: { $center: [[x, y], r] } } }` for area reads.
+  - `findNearby` optionally intersects the result with the *live* session id set, so an
+    archive row can never masquerade as an active user.
+- Live presence is always the in-memory registry. A slow consistency check
+  (`server/src/realtime/spatialCheck.js`, every 30 s) compares the database `$near`
+  result with the in-memory grid at the most recently active player and logs any
+  disagreement, noting that the archive lags by up to one flush interval.
+- Failure handling: every database call is wrapped; a missing connection, a timeout or
+  a rejected operation returns `{ ok: false, reason: 'database unavailable' }`, is
+  counted in `stats.persistFailures` and never propagates into a socket handler.
+- Measured behaviour: see `docs/SESSION_05_REPORT.md` §6 and
+  `scripts/bench-proximity.mjs`. **No MongoDB performance is claimed anywhere**: this
+  environment has no `mongod`, so the database code path is exercised against the
+  in-process double `server/src/test/fakeMongo.js`, and the numbers published for it
+  are that double's numbers.
 
 ## 8. WebRTC Signaling Flow
 

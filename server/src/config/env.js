@@ -25,6 +25,9 @@ export const DEFAULTS = Object.freeze({
   LOG_LEVEL: 'info',
   SHUTDOWN_TIMEOUT_MS: '10000',
   MONGODB_DB: 'proxispeak',
+  MONGODB_COLLECTION: 'positions',
+  PROXIMITY_RADIUS: '100',
+  POSITION_FLUSH_MS: '2000',
 })
 
 const VALID_LOG_LEVELS = new Set(['error', 'warn', 'info', 'debug'])
@@ -84,6 +87,21 @@ export function parseConfig(source = {}) {
     corsOrigins: Object.freeze(corsOrigins),
     mongoUri: read(source, 'MONGODB_URI') ?? null,
     mongoDb: read(source, 'MONGODB_DB') ?? DEFAULTS.MONGODB_DB,
+    mongoCollection: read(source, 'MONGODB_COLLECTION') ?? DEFAULTS.MONGODB_COLLECTION,
+    /** Listening radius in world units (planar, not metres). */
+    proximityRadius: parseInteger(source.PROXIMITY_RADIUS, {
+      key: 'PROXIMITY_RADIUS',
+      fallback: DEFAULTS.PROXIMITY_RADIUS,
+      min: 1,
+      max: 2000,
+    }),
+    /** How often a moving player's position is written to MongoDB. */
+    positionFlushMs: parseInteger(source.POSITION_FLUSH_MS, {
+      key: 'POSITION_FLUSH_MS',
+      fallback: DEFAULTS.POSITION_FLUSH_MS,
+      min: 250,
+      max: 60_000,
+    }),
   })
 }
 

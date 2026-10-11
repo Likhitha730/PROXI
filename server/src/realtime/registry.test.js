@@ -101,4 +101,16 @@ describe('player registry', () => {
       player.x = 0
     }).toThrow()
   })
+
+  it('maps a player id back to the socket hosting it (socketIdFor)', () => {
+    const registry = makeRegistry()
+    const { player } = registry.add({ socketId: 'socket-1', name: 'Ada' })
+
+    expect(registry.socketIdFor(player.id)).toBe('socket-1')
+    expect(registry.socketIdFor('nobody')).toBe(null)
+    expect(registry.getById(player.id)).toMatchObject({ id: player.id, name: 'Ada' })
+
+    registry.remove('socket-1')
+    expect(registry.socketIdFor(player.id)).toBe(null)
+  })
 })

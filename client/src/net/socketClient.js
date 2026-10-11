@@ -154,6 +154,7 @@ function bindProtocol(activeSocket) {
   activeSocket.on(EVENTS.JOINED, (payload) => presence.applyJoined(payload))
   activeSocket.on(EVENTS.MOVED, (update) => presence.applyMove(update))
   activeSocket.on(EVENTS.LEFT, (payload) => presence.applyLeft(payload))
+  activeSocket.on(EVENTS.PROXIMITY, (payload) => presence.applyProximity(payload))
   activeSocket.on(EVENTS.ERROR, (payload) => presence.applyError(payload))
 }
 

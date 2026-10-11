@@ -208,3 +208,136 @@ describe('teardown', () => {
     expect(peer.motion.delayMs).toBe(LIMITS.INTERPOLATION_DELAY_MS)
   })
 })
+
+describe('proximity results (proximity:update)', () => {
+  const proximityPayload = (neighbours, overrides = {}) => ({
+    id: 'self-1',
+    radius: LIMITS.PROXIMITY_RADIUS,
+    at: 1_700_000_000_123,
+    neighbours,
+    ...overrides,
+  })
+
+  const neighbour = (overrides = {}) => ({ id: 'player-a', name: 'Ada', x: 1300, y: 1500, distance: 20, nearby: true, ...overrides })
+
+  it('starts with the documented default radius and no neighbours', () => {
+    const { presence } = joinedPresence()
+    expect(presence.getProximity()).toMatchObject({ radius: LIMITS.PROXIMITY_RADIUS, count: 0 })
+    expect(presence.getProximity().nearby).toEqual([])
+    expect(presence.getSnapshot().proximity.count).toBe(0)
+  })
+
+  it('records positions and distances for nearby users', () => {
+    const { presence } = joinedPresence()
+    presence.applyProximity(proximityPayload([neighbour()]))
+
+    const view = presence.getProximity()
+    expect(view.radius).toBe(100)
+    expect(view.at).toBe(1_700_000_000_123)
+    expect(view.nearby[0]).toEqual({ id: 'player-a', name: 'Ada', distance: 20, x: 1300, y: 1500 })
+    expect(presence.getSnapshot().proximity.nearby[0].distance).toBe(20)
+  })
+
+  it('flags the peer objects the canvas ring reads, and clears the flag when they leave range', () => {
+    const { presence } = joinedPresence()
+    presence.applyProximity(proximityPayload([neighbour()]))
+    expect(presence.getPeers()[0]).toMatchObject({ id: 'player-a', nearby: true, distance: 20 })
+
+    presence.applyProximity(proximityPayload([]))
+    expect(presence.getPeers()[0]).toMatchObject({ id: 'player-a', nearby: false, distance: null })
+  })
+
+  it('never lists us as our own neighbour, even if the server sent it', () => {
+    const { presence } = joinedPresence()
+    presence.applyProximity(proximityPayload([neighbour({ id: 'self-1', name: 'Me', distance: 0 })]))
+    expect(presence.getProximity().nearby).toEqual([])
+  })
+
+  it('deduplicates entries and orders them nearest first', () => {
+    const { presence } = joinedPresence()
+    presence.applyProximity(
+      proximityPayload([
+        neighbour({ id: 'player-c', name: 'Carol', distance: 60 }),
+        neighbour({ id: 'player-a', name: 'Ada', distance: 20 }),
+        neighbour({ id: 'player-c', name: 'Carol', distance: 55 }),
+      ]),
+    )
+
+    const nearby = presence.getProximity().nearby
+    expect(nearby.map((entry) => entry.id)).toEqual(['player-a', 'player-c'])
+    expect(nearby.map((entry) => entry.distance)).toEqual([20, 60])
+  })
+
+  it('ignores malformed payloads instead of throwing', () => {
+    const { presence } = joinedPresence()
+    for (const payload of [null, undefined, {}, { neighbours: 'nope' }, { neighbours: [null, {}] }]) {
+      expect(() => presence.applyProximity(payload)).not.toThrow()
+    }
+    expect(presence.getProximity().nearby).toEqual([])
+  })
+
+  it('adopts the radius the server reports', () => {
+    const { presence } = joinedPresence()
+    presence.applyProximity(proximityPayload([], { radius: 175 }))
+    expect(presence.getProximity().radius).toBe(175)
+    expect(presence.proximityRadius).toBe(175)
+    expect(presence.getSnapshot().proximity.radius).toBe(175)
+  })
+
+  it('notifies React the moment the nearby set changes', () => {
+    const { presence } = joinedPresence()
+    const listener = vi.fn()
+    presence.subscribe(listener)
+
+    presence.applyProximity(proximityPayload([neighbour()]))
+    expect(listener).toHaveBeenCalledTimes(1)
+
+    presence.applyProximity(proximityPayload([neighbour({ id: 'player-b', name: 'Grace', distance: 40 })]))
+    expect(listener).toHaveBeenCalledTimes(2)
+  })
+
+  it('rate-limits distance-only refreshes so a walking neighbour cannot re-render the HUD 4x/second', () => {
+    const clock = createClock(1000)
+    const presence = createPresence({ now: clock })
+    presence.applySnapshot({ self: record({ id: 'self-1', name: 'Me' }), players: [record()], room: { id: 'lobby' } })
+
+    const listener = vi.fn()
+    presence.subscribe(listener)
+
+    presence.applyProximity(proximityPayload([neighbour({ distance: 20 })]))
+    expect(listener).toHaveBeenCalledTimes(1)
+
+    // 4 Hz traffic (a frame every 250 ms) with only the distance moving: React hears
+    // about it once per PROXIMITY_UI_INTERVAL_MS (500 ms), not four times a second.
+    for (const [distance, expected] of [[21, 1], [22, 2], [23, 2]]) {
+      clock.advance(250)
+      presence.applyProximity(proximityPayload([neighbour({ distance })]))
+      expect(listener).toHaveBeenCalledTimes(expected)
+    }
+
+    // The model itself is always current — only the HUD notification is rate-limited.
+    expect(presence.getProximity().nearby[0].distance).toBe(23)
+    expect(presence.getPeers()[0].distance).toBe(23)
+    expect(presence.getSnapshot().proximity.nearby[0].distance).toBe(22)
+  })
+
+  it('drops proximity state when a session resets', () => {
+    const { presence } = joinedPresence()
+    presence.applyProximity(proximityPayload([neighbour()]))
+    presence.reset()
+
+    expect(presence.getProximity()).toMatchObject({ radius: LIMITS.PROXIMITY_RADIUS, count: 0 })
+    expect(presence.getSnapshot().proximity.count).toBe(0)
+  })
+
+  it('keeps the snapshot frozen, proximity included', () => {
+    const { presence } = joinedPresence()
+    presence.applyProximity(proximityPayload([neighbour()]))
+
+    const snapshot = presence.getSnapshot()
+    expect(Object.isFrozen(snapshot)).toBe(true)
+    expect(Object.isFrozen(snapshot.proximity)).toBe(true)
+    expect(Object.isFrozen(snapshot.proximity.nearby)).toBe(true)
+    expect(Object.isFrozen(snapshot.proximity.nearby[0])).toBe(true)
+  })
+})

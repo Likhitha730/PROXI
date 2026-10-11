@@ -25,13 +25,21 @@ let root
 let raf
 let presence
 
-function buildPresence({ peers = [], self = { id: 'self-1', name: 'Me', x: 1280, y: 1500 } } = {}) {
+function buildPresence({ peers = [], self = { id: 'self-1', name: 'Me', x: 1280, y: 1500 }, nearby = [] } = {}) {
   const instance = createPresence({ now: () => 0 })
   instance.applySnapshot({
     self,
     players: peers.map((name, index) => ({ id: `peer-${index}`, name, x: 900, y: 800, dir: 0, moving: false })),
     room: { id: 'proxispeak-lobby', maxPlayers: 24 },
   })
+  if (nearby.length > 0) {
+    instance.applyProximity({
+      id: self.id,
+      radius: 100,
+      at: Date.now(),
+      neighbours: nearby.map(({ id, name, distance }) => ({ id, name, x: 900, y: 800, distance, nearby: true })),
+    })
+  }
   return instance
 }
 
@@ -105,6 +113,46 @@ describe('PresencePanel', () => {
     expect(getDisplayName()).toBe('Ada Lovelace')
     expect(globalThis.localStorage.getItem('proxispeak.displayName')).toBe('Ada Lovelace')
     expect(input.value).toBe('Ada Lovelace')
+  })
+
+  it('shows nearby users with the distance the server measured', () => {
+    presence = buildPresence({
+      peers: ['Ada', 'Grace'],
+      nearby: [
+        { id: 'peer-1', name: 'Grace', distance: 42.4 },
+        { id: 'peer-0', name: 'Ada', distance: 12 },
+      ],
+    })
+    mount(<PresencePanel presence={presence.getSnapshot()} connection={CONNECTION} />)
+
+    const list = container.querySelector('[data-testid="presence-nearby"]')
+    // nearest first, distances rounded for the eye
+    expect(list.textContent).toContain('Ada')
+    expect(list.textContent).toContain('12 u')
+    expect(list.textContent).toContain('42 u')
+    expect(list.textContent.indexOf('Ada')).toBeLessThan(list.textContent.indexOf('Grace'))
+    // the radius in force is stated, so "nearby" is never a mystery number
+    expect(container.querySelector('[data-testid="presence-nearby-block"]').textContent).toContain('within 100 u')
+  })
+
+  it('marks roster entries that are inside the radius', () => {
+    presence = buildPresence({ peers: ['Ada', 'Grace'], nearby: [{ id: 'peer-1', name: 'Grace', distance: 30 }] })
+    mount(<PresencePanel presence={presence.getSnapshot()} connection={CONNECTION} />)
+
+    const items = [...container.querySelectorAll('[data-testid="presence-roster"] .presence__item')]
+    expect(items).toHaveLength(2)
+    expect(items[1].querySelector('.presence__dot--nearby')).not.toBeNull() // Grace
+    expect(items[0].querySelector('.presence__dot--nearby')).toBeNull() // Ada
+  })
+
+  it('explains an empty nearby list', () => {
+    presence = buildPresence({ peers: ['Ada'] })
+    mount(<PresencePanel presence={presence.getSnapshot()} connection={CONNECTION} />)
+    expect(container.querySelector('[data-testid="presence-nearby"]').textContent).toMatch(/nobody within earshot/i)
+
+    presence = buildPresence({ peers: ['Ada'] })
+    mount(<PresencePanel presence={presence.getSnapshot()} connection={{ ...CONNECTION, status: 'error' }} />)
+    expect(container.querySelector('[data-testid="presence-nearby"]').textContent).toMatch(/offline/i)
   })
 
   it('renders a server error with a dismiss action', () => {

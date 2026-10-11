@@ -25,7 +25,7 @@ import { SPAWNS, WALKABLE_BOUNDS, WORLD } from '../../../client/src/world/worldD
 
 describe('protocol shape', () => {
   it('exposes exactly the documented event set', () => {
-    expect(ALL_EVENTS).toHaveLength(7)
+    expect(ALL_EVENTS).toHaveLength(8)
     expect(ALL_EVENTS).toEqual([
       'player:join',
       'player:move',
@@ -33,6 +33,7 @@ describe('protocol shape', () => {
       'player:joined',
       'player:moved',
       'player:left',
+      'proximity:update',
       'server:error',
     ])
     expect(new Set(ALL_EVENTS).size).toBe(ALL_EVENTS.length)
@@ -40,10 +41,10 @@ describe('protocol shape', () => {
 
   it('namespaces every event by the entity it concerns', () => {
     for (const name of ALL_EVENTS) {
-      expect(name).toMatch(/^(player|players|server):[a-z]+$/)
+      expect(name).toMatch(/^(player|players|proximity|server):[a-z]+$/)
     }
     expect(CLIENT_TO_SERVER_EVENTS).toEqual([EVENTS.JOIN, EVENTS.MOVE])
-    expect(SERVER_TO_CLIENT_EVENTS).toHaveLength(5)
+    expect(SERVER_TO_CLIENT_EVENTS).toHaveLength(6)
   })
 
   it('agrees with the map data the renderer uses', () => {

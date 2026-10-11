@@ -13,11 +13,25 @@ import { config as defaultConfig, createOriginValidator } from './config/env.js'
 import { createLogger } from './lib/logger.js'
 import { registerSocketHandlers } from './sockets/handlers.js'
 import { createPlayerRegistry } from './realtime/registry.js'
+import { createPositionsRepository } from './db/positions.js'
+import { createSpatialCheck } from './realtime/spatialCheck.js'
+import { getDatabase } from './db/mongo.js'
 import { closeDatabase, connectDatabase } from './db/mongo.js'
 
 /** Builds the app, HTTP server and Socket.IO instance without listening. */
-export function createServer({ config = defaultConfig, logger = createLogger({ level: defaultConfig.logLevel }) } = {}) {
+/** How often the database proximity path is cross-checked against the live grid. */
+const CHECK_INTERVAL_MS = 30_000
+
+export function createServer({
+  config = defaultConfig,
+  logger = createLogger({ level: defaultConfig.logLevel }),
+  // Injection point: production passes the real handle (the default), tests pass a
+  // double so the persistence code path can be exercised without a MongoDB server.
+  getDatabase: getDatabaseHandle = getDatabase,
+} = {}) {
   const app = createApp({ config, logger })
+  /** Background work started by main(); tests never call it. */
+  const pendingStartup = []
   const httpServer = http.createServer(app)
 
   const io = new Server(httpServer, {
@@ -38,9 +52,52 @@ export function createServer({ config = defaultConfig, logger = createLogger({ l
   // One registry per server instance, owned here so tests and future services
   // (proximity, persistence) can inspect the same authoritative presence table.
   const registry = createPlayerRegistry()
-  const realtime = registerSocketHandlers(io, { logger, config, registry })
 
-  return { app, httpServer, io, logger, config, registry, realtime }
+  // Positions repository: persistence only. Its queries read the archive; live
+  // presence is always the registry, so the realtime path never waits on MongoDB.
+  const positions = createPositionsRepository({
+    getDatabase: getDatabaseHandle,
+    collectionName: config.mongoCollection,
+    logger,
+  })
+
+  const realtime = registerSocketHandlers(io, { logger, config, registry, positions })
+
+  // Slow cross-check that the planar database query and the in-memory grid agree.
+  const spatialCheck = createSpatialCheck({ proximity: realtime.proximity, positions, registry, logger })
+
+  /**
+   * Register background work (database connection, index creation, pruning) without
+   * starting it. `createServer` deliberately starts nothing: tests build servers
+   * without touching MongoDB, and `main()` runs the queued work once the HTTP
+   * listener is up.
+   */
+  function deferStartup(task) {
+    pendingStartup.push(task)
+    return task
+  }
+
+  /** Run everything queued with `deferStartup`. A failing task is reported, never thrown. */
+  async function runStartupTasks() {
+    return Promise.all(pendingStartup.map((task) => Promise.resolve(task).catch((error) => {
+      logger.warn('startup task failed', { reason: error?.message })
+      return null
+    })))
+  }
+
+  return {
+    app,
+    httpServer,
+    io,
+    logger,
+    config,
+    registry,
+    realtime,
+    positions,
+    spatialCheck,
+    deferStartup,
+    runStartupTasks,
+  }
 }
 
 function closeHttpServer(server) {
@@ -53,7 +110,7 @@ function closeHttpServer(server) {
   })
 }
 
-export function installShutdownHandlers({ httpServer, io, logger, config }) {
+export function installShutdownHandlers({ httpServer, io, logger, config, positions = null, registry = null }) {
   let shuttingDown = false
 
   async function shutdown(signal, exitCode = 0) {
@@ -71,6 +128,21 @@ export function installShutdownHandlers({ httpServer, io, logger, config }) {
     force.unref?.()
 
     try {
+      // Flush live positions so a restart does not lose the last few seconds of
+      // movement, then close in order: sockets, HTTP, database.
+      if (positions && registry) {
+        const records = registry.list().map((player) => ({
+          sessionId: player.id,
+          name: player.name,
+          x: player.x,
+          y: player.y,
+          connected: true,
+        }))
+        if (records.length > 0) {
+          const flushed = await positions.saveMany(records)
+          logger.info('flushed live positions', { players: records.length, ok: flushed?.ok !== false })
+        }
+      }
       await new Promise((resolve) => io.close(() => resolve()))
       await closeHttpServer(httpServer)
       await closeDatabase()
@@ -99,18 +171,43 @@ export function installShutdownHandlers({ httpServer, io, logger, config }) {
 
 async function main() {
   const logger = createLogger({ level: defaultConfig.logLevel, scope: 'server' })
-  const { httpServer, io } = createServer({ config: defaultConfig, logger })
+  const { httpServer, io, positions, spatialCheck, registry, deferStartup, runStartupTasks } = createServer({
+    config: defaultConfig,
+    logger,
+  })
 
-  // Persistence is optional in this milestone: started in the background and
-  // never awaited, so an unreachable cluster cannot delay or fail startup.
-  connectDatabase({ uri: defaultConfig.mongoUri, dbName: defaultConfig.mongoDb, logger })
+  // Persistence is optional: connecting runs in the background and is never
+  // awaited, so an unreachable cluster cannot delay or fail startup. Index creation
+  // and the archive prune run only once the connection actually succeeds.
+  deferStartup(
+    connectDatabase({ uri: defaultConfig.mongoUri, dbName: defaultConfig.mongoDb, logger }).then(async (database) => {
+      if (!database) return null
+      const status = await positions.ensureIndexes()
+      logger.info('position indexes ready', {
+        created: status.created?.length ?? 0,
+        present: status.present?.length ?? 0,
+        conflicts: status.conflicts ?? [],
+      })
+      const pruned = await positions.pruneStale({ maxAgeMs: 60 * 60 * 1000 })
+      if (pruned?.deletedCount) logger.info('pruned stale position records', { removed: pruned.deletedCount })
+      return database
+    }),
+  )
 
-  installShutdownHandlers({ httpServer, io, logger, config: defaultConfig })
+  // The consistency check only does anything while a database is available.
+  const checkTimer = setInterval(() => {
+    spatialCheck.runOnce().catch((error) => logger.warn('spatial check failed', { reason: error?.message }))
+  }, CHECK_INTERVAL_MS)
+  checkTimer.unref?.()
+
+  installShutdownHandlers({ httpServer, io, logger, config: defaultConfig, positions, registry })
 
   await new Promise((resolve, reject) => {
     httpServer.once('error', reject)
     httpServer.listen(defaultConfig.port, defaultConfig.host, resolve)
   })
+
+  runStartupTasks() // connection, indexes and prune: reported, never blocking
 
   logger.info('ProxiSpeak server ready', {
     host: defaultConfig.host,

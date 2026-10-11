@@ -15,6 +15,7 @@
     "socket.io": "^4.8.1"
   },
   "devDependencies": {
+    "socket.io-client": "^4.8.1",
     "vitest": "^2.1.8"
   }
 }
