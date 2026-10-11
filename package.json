@@ -1,0 +1,16 @@
+{
+  "name": "proxispeak",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "dev:client": "npm --prefix client run dev",
+    "dev:server": "npm --prefix server run dev",
+    "build:client": "npm --prefix client run build",
+    "validate:world": "node scripts/validate-world.mjs",
+    "smoke:socket": "node scripts/smoke-socket.mjs"
+  },
+  "engines": {
+    "node": ">=20"
+  }
+}

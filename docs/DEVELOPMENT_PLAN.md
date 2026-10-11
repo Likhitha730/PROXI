@@ -1,0 +1,80 @@
+# ProxiSpeak — Development Plan
+
+**Last updated:** 2026-10-11
+**Scope of this session:** documentation only (this file, PROJECT_REQUIREMENTS.md, ARCHITECTURE.md, .gitignore). No application code, no dependency installation.
+
+## Guiding Rules
+
+- Small, testable modules; rendering strictly separated from network state.
+- JavaScript only; no TypeScript; no unnecessary libraries.
+- Nothing is "done" until its acceptance criteria are executed and observed.
+- Frontend dev server: Vite port 5173 with `strictPort: true` — fail loudly if the port is occupied.
+
+## Phase 0 — Scaffolding (next session)
+
+Tasks:
+
+1. Create folder structure per ARCHITECTURE.md §2 (`client/`, `server/`, `docs/`).
+2. Root `package.json` (simple scripts; no workspaces tooling in v1).
+3. `client/package.json`: React, React DOM, Vite, `@vitejs/plugin-react`, Socket.IO client.
+4. `server/package.json`: Express, Socket.IO, `mongodb` (official driver), `dotenv`.
+5. `client/vite.config.js` with `server: { port: 5173, strictPort: true }` and proxy `/socket.io` → backend in dev.
+6. `.env.example` on both sides documenting every key (no values).
+
+Acceptance criteria:
+
+- `npm run dev` (client) serves on http://localhost:5173 and fails with a clear error if the port is taken.
+- `npm run dev` (server) starts Express + Socket.IO and logs readiness.
+- `.env.example` exists; `.env` is gitignored.
+- Folder structure matches ARCHITECTURE.md §2.
+
+## Phase 1 — World Rendering (Canvas)
+
+Tasks: world data JSON (zones, walls, furniture, decor); camera (follow, clamp, zoom-to-cursor); rAF loop with delta time; render pipeline floor → furniture → decor.
+
+Acceptance criteria: office renders at 60 fps; zoom 0.5–2.0 works; camera never shows outside world bounds (letterboxed).
+
+## Phase 2 — Local Avatar
+
+Tasks: keyboard input (WASD/arrows); delta-time movement; circle-vs-AABB collision; directional walking + idle animation (vector-drawn avatar).
+
+Acceptance criteria: smooth 60 fps movement; avatar cannot leave bounds or cross walls; animation direction matches movement direction.
+
+## Phase 3 — Presence & Movement Sync (Socket.IO)
+
+Tasks: server presence service (join/leave, in-memory state, validated position broadcast, disconnect cleanup); client socket wrapper; world store; remote avatar interpolation (120 ms buffer).
+
+Acceptance criteria: two tabs — remote avatar moves smoothly; disconnect removes the avatar and cleans all server state; no duplicate listeners; no stale user records.
+
+## Phase 4 — Proximity Detection
+
+Tasks: server proximity service (350 units, throttled `proximity:update`); client nearby-users panel (React HUD) with names and distances.
+
+Acceptance criteria: panel updates ≤ 5 Hz; lists exactly the users within range; displayed distances match measured world distance.
+
+## Phase 5 — WebRTC Audio + Spatial Audio
+
+Tasks: proximity-filtered peer connections (450 units, 50-unit hysteresis); signaling relay; STUN; mic permission handling; Web Audio graph (distance gain + stereo pan per peer).
+
+Acceptance criteria: voice connects only within range; volume decreases and pan shifts with position; teardown on exit; mic denial degrades gracefully with a clear UI state.
+
+## Phase 6 — Persistence, Polish, Verification
+
+Tasks: MongoDB Atlas integration (`users`, `positionSnapshots` with `2dsphere` + TTL indexes, low-frequency writes); connection-state UI; error toasts; rate limiting; final security review; full manual E2E checklist executed and recorded.
+
+Acceptance criteria: all v1 acceptance criteria in PROJECT_REQUIREMENTS.md §6 pass; no console errors; DB writes verified in Atlas.
+
+## Later Sessions (explicitly not started here)
+
+- Git repository initialization and production deployment.
+- Authentication, TURN infrastructure, multi-room support, text chat.
+
+## Definition of Done (per phase)
+
+1. Acceptance criteria executed and observed.
+2. No new lint errors (linting configured in Phase 0).
+3. Docs updated if the design changed.
+
+## Exact Next Implementation Step
+
+Phase 0, task 1–2: create the folder structure (`client/`, `server/`) and the root `package.json`, then `client/package.json` (Vite + React + Socket.IO client) and `server/package.json` (Express + Socket.IO + mongodb), plus `client/vite.config.js` with `server: { port: 5173, strictPort: true }` and `.env.example`. Then verify both dev servers start. No application logic in that step.
